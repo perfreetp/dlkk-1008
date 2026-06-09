@@ -55,6 +55,44 @@ def _refresh_arrear_status(conn, arrear_id: int):
     return unpaid, new_total, new_status
 
 
+def _sync_batch_after_change(conn, arrear_id: int, kind: str, detail: str = ""):
+    """欠费状态改变后同步batch_members，kind: call/commit/discount/payment"""
+    if not arrear_id:
+        return
+    unpaid_row = conn.execute(f"SELECT {UNPAID_SQL_EXPR} as u, a.paid_amount, a.discount_amount FROM arrears a WHERE a.id = ?",
+                              (arrear_id,)).fetchone()
+    if not unpaid_row:
+        return
+    unpaid = float(unpaid_row["u"] or 0)
+    paid = float(unpaid_row["paid_amount"] or 0)
+    disc = float(unpaid_row["discount_amount"] or 0)
+    members = conn.execute("SELECT * FROM batch_members WHERE arrear_id = ?", (arrear_id,)).fetchall()
+    batch_ids = set()
+    for m in members:
+        batch_ids.add(m["batch_id"])
+        if kind == "call":
+            conn.execute("UPDATE batch_members SET call_status=? WHERE id=?", (detail or "已联系", m["id"]))
+        elif kind == "commit":
+            conn.execute("UPDATE batch_members SET call_status='已联系', commitment_status=? WHERE id=?",
+                         (detail or "已承诺", m["id"]))
+        elif kind in ("discount", "payment"):
+            repayment = paid + disc
+            if unpaid < 0.01:
+                rs = "全部回款"
+            elif repayment > 0:
+                rs = "部分回款"
+            else:
+                rs = "未回款"
+            conn.execute("UPDATE batch_members SET repayment_status=?, repayment_amount=? WHERE id=?",
+                         (rs, round(repayment, 2), m["id"]))
+    for bid in batch_ids:
+        try:
+            from .batch_cmd import _refresh_batch_stats
+            _refresh_batch_stats(conn, bid)
+        except Exception:
+            pass
+
+
 @record_cmd.command("call", help="登记电话沟通记录")
 @click.option("--room", "-r", "room_no", required=True, help="房号")
 @click.option("--arrear-id", type=int, help="关联欠费ID")
@@ -86,9 +124,9 @@ def record_call(room_no, arrear_id, contact, call_time, result, commitment_date,
             return
     else:
         ar = conn.execute(f"""
-            SELECT * FROM arrears
-            WHERE household_id = ? AND {UNPAID_SQL_EXPR} > 0
-            ORDER BY due_date ASC LIMIT 1
+            SELECT * FROM arrears a
+            WHERE a.household_id = ? AND {UNPAID_SQL_EXPR} > 0
+            ORDER BY a.due_date ASC LIMIT 1
         """, (household_id,)).fetchone()
 
     arrear_id_val = ar["id"] if ar else None
@@ -126,6 +164,9 @@ def record_call(room_no, arrear_id, contact, call_time, result, commitment_date,
 
         if arrear_id_val and (result == "已联系/承诺付款" or commitment_date):
             _refresh_arrear_status(conn, arrear_id_val)
+            _sync_batch_after_change(conn, arrear_id_val, "commit" if (result == "已联系/承诺付款" or commitment_date) else "call", result)
+        elif arrear_id_val:
+            _sync_batch_after_change(conn, arrear_id_val, "call", result)
 
         conn.commit()
         console.print("[green]通话记录已登记[/green]")
@@ -257,6 +298,7 @@ def mark_commitment(arrear_id, commit_date, amount, remark):
               datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
               cd, actual_amount, remark or "系统标记承诺付款"))
         _refresh_arrear_status(conn, arrear_id)
+        _sync_batch_after_change(conn, arrear_id, "commit", "系统标记承诺")
         conn.commit()
         console.print("[green]已标记承诺付款[/green]")
     except Exception as e:
@@ -328,6 +370,7 @@ def record_discount(arrear_id, amount, reason, approved_by, remark):
             WHERE id = ?
         """, (amount, arrear_id))
         _refresh_arrear_status(conn, arrear_id)
+        _sync_batch_after_change(conn, arrear_id, "discount", f"减免{amount}")
         conn.commit()
         console.print(f"[green]已登记减免 {format_money(amount)} 元，尚余 {format_money(new_unpaid)} 元[/green]")
     except Exception as e:
@@ -450,6 +493,7 @@ def record_payment(arrear_id, amount, pay_date, method, operator, remark):
             WHERE id = ?
         """, (amount, remark or None, arrear_id))
         _, _, new_st = _refresh_arrear_status(conn, arrear_id)
+        _sync_batch_after_change(conn, arrear_id, "payment", f"缴费{amount}")
         conn.commit()
         console.print(f"[green]已登记缴费 {format_money(amount)} 元，余额 {format_money(new_unpaid)} 元，状态 {new_st}[/green]")
     except Exception as e:

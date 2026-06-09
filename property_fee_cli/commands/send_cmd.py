@@ -202,7 +202,8 @@ def _dispatch_send(phone: str, content: str) -> tuple[bool, str, str, bool]:
 @click.option("--dry-run", is_flag=True, help="仅模拟发送，不更新状态")
 @click.option("--retry-failed", is_flag=True, help="同时重试之前发送失败的通知")
 @click.option("--force-mock", is_flag=True, help="强制使用模拟发送（即使配置了真实服务）")
-def send_all(batch_size, interval, force, dry_run, retry_failed, force_mock):
+@click.option("--batch", "batch_id", type=int, default=None, help="只发送指定批次ID的通知")
+def send_all(batch_size, interval, force, dry_run, retry_failed, force_mock, batch_id):
     cfg_ok, cfg = is_sms_real_configured()
     mode_label = "[red]【模拟发送】[/red]" if (not cfg_ok or force_mock) else "[green]【真实发送】[/green]"
     console.print(f"[bold]发送模式: {mode_label}[/bold]")
@@ -221,17 +222,24 @@ def send_all(batch_size, interval, force, dry_run, retry_failed, force_mock):
     if retry_failed:
         status_filter = ("'待发送'", "'发送失败'")
 
+    batch_where = ""
+    params: list = []
+    if batch_id:
+        batch_where = " AND nr.batch_id = ?"
+        params.append(batch_id)
+
     total_row = conn.execute(f"""
-        SELECT COUNT(*) as cnt FROM notice_records
-        WHERE status IN ({','.join(status_filter)}) AND retry_count < max_retry
-    """).fetchone()
+        SELECT COUNT(*) as cnt FROM notice_records nr
+        WHERE nr.status IN ({','.join(status_filter)}) AND nr.retry_count < nr.max_retry
+        {batch_where}
+    """, params).fetchone()
     total = total_row["cnt"]
     if total == 0:
         console.print("[yellow]没有可发送的通知（队列为空或已超过最大重试次数）[/yellow]")
         conn.close()
         return
 
-    console.print(f"[bold]待发送通知: {total} 条[/bold]")
+    console.print(f"[bold]待发送通知: {total} 条[/bold]" + (f"  (批次 {batch_id})" if batch_id else ""))
     if not click.confirm("确认开始发送？"):
         conn.close()
         return
@@ -240,8 +248,9 @@ def send_all(batch_size, interval, force, dry_run, retry_failed, force_mock):
         SELECT nr.*, h.room_no, h.owner_name, h.phone as h_phone
         FROM notice_records nr JOIN households h ON nr.household_id = h.id
         WHERE nr.status IN ({','.join(status_filter)}) AND nr.retry_count < nr.max_retry
+        {batch_where}
         ORDER BY nr.created_at ASC
-    """).fetchall()
+    """, params).fetchall()
 
     success = 0
     fail = 0
@@ -266,6 +275,7 @@ def send_all(batch_size, interval, force, dry_run, retry_failed, force_mock):
                 continue
 
             nr_id = r["id"]
+            arrear_id = r["arrear_id"]
             phone = r["phone"] or r["h_phone"]
             content = r["content"]
 
@@ -275,6 +285,9 @@ def send_all(batch_size, interval, force, dry_run, retry_failed, force_mock):
                         UPDATE notice_records SET status = '发送失败', error_msg = '无手机号',
                             retry_count = retry_count + 1 WHERE id = ?
                     """, (nr_id,))
+                    if batch_id:
+                        conn.execute("UPDATE batch_members SET notice_status='发送失败' WHERE batch_id=? AND arrear_id=?",
+                                     (batch_id, arrear_id))
                 fail += 1
                 progress.advance(task)
                 continue
@@ -301,6 +314,9 @@ def send_all(batch_size, interval, force, dry_run, retry_failed, force_mock):
                             is_mock = ?, provider = ?, message_id = ?
                         WHERE id = ?
                     """, (new_retry, r["max_retry"], 1 if is_mock else 0, prov, msg_id, nr_id))
+                    if batch_id:
+                        conn.execute("UPDATE batch_members SET notice_status='发送成功' WHERE batch_id=? AND arrear_id=?",
+                                     (batch_id, arrear_id))
                     success += 1
                 else:
                     conn.execute("""
@@ -310,6 +326,9 @@ def send_all(batch_size, interval, force, dry_run, retry_failed, force_mock):
                             is_mock = ?, provider = ?, message_id = ?
                         WHERE id = ?
                     """, (msg, new_retry, r["max_retry"], 1 if is_mock else 0, prov, msg_id, nr_id))
+                    if batch_id:
+                        conn.execute("UPDATE batch_members SET notice_status='发送失败' WHERE batch_id=? AND arrear_id=?",
+                                     (batch_id, arrear_id))
                     fail += 1
             else:
                 if ok:
@@ -321,6 +340,9 @@ def send_all(batch_size, interval, force, dry_run, retry_failed, force_mock):
             progress.advance(task)
 
     if not dry_run:
+        if batch_id:
+            from .batch_cmd import _refresh_batch_stats
+            _refresh_batch_stats(conn, batch_id)
         conn.commit()
     conn.close()
 
@@ -345,7 +367,8 @@ def send_all(batch_size, interval, force, dry_run, retry_failed, force_mock):
 @click.option("--force", is_flag=True, help="忽略时段限制")
 @click.option("--dry-run", is_flag=True)
 @click.option("--force-mock", is_flag=True, help="强制模拟发送")
-def retry_failed(record_id, retry_all, max_retry, force, dry_run, force_mock):
+@click.option("--batch", "batch_id", type=int, default=None, help="只重试指定批次ID的失败通知")
+def retry_failed(record_id, retry_all, max_retry, force, dry_run, force_mock, batch_id):
     if not record_id and not retry_all:
         console.print("[red]请指定 --record-id 或 --all[/red]")
         return
@@ -370,16 +393,21 @@ def retry_failed(record_id, retry_all, max_retry, force, dry_run, force_mock):
             return
         rows = [row]
     else:
-        rows = conn.execute("""
+        sql = """
             SELECT nr.*, h.room_no, h.owner_name, h.phone as h_phone
             FROM notice_records nr JOIN households h ON nr.household_id = h.id
             WHERE nr.status = '发送失败'
-        """).fetchall()
+        """
+        params: list = []
+        if batch_id:
+            sql += " AND nr.batch_id = ?"
+            params.append(batch_id)
+        rows = conn.execute(sql, params).fetchall()
     if not rows:
         console.print("[yellow]没有可重试的失败通知[/yellow]")
         conn.close()
         return
-    console.print(f"[bold]待重试: {len(rows)} 条[/bold]")
+    console.print(f"[bold]待重试: {len(rows)} 条[/bold]" + (f"  (批次 {batch_id})" if batch_id else ""))
     if not click.confirm("确认重试？"):
         conn.close()
         return
@@ -399,6 +427,9 @@ def retry_failed(record_id, retry_all, max_retry, force, dry_run, force_mock):
                 fail += 1
                 if not dry_run:
                     conn.execute("UPDATE notice_records SET error_msg = '超过最大重试次数' WHERE id = ?", (r["id"],))
+                    if batch_id:
+                        conn.execute("UPDATE batch_members SET notice_status='发送失败' WHERE batch_id=? AND arrear_id=?",
+                                     (batch_id, r["arrear_id"]))
                 progress.advance(task)
                 continue
 
@@ -418,6 +449,9 @@ def retry_failed(record_id, retry_all, max_retry, force, dry_run, force_mock):
                             retry_count = ?, max_retry = ?, is_mock = ?, provider = ?, message_id = ?
                         WHERE id = ?
                     """, (new_retry, effective_max, 1 if is_mock else 0, prov, msg_id, r["id"]))
+                    if batch_id:
+                        conn.execute("UPDATE batch_members SET notice_status='发送成功' WHERE batch_id=? AND arrear_id=?",
+                                     (batch_id, r["arrear_id"]))
                     success += 1
                 else:
                     conn.execute("""
@@ -426,6 +460,9 @@ def retry_failed(record_id, retry_all, max_retry, force, dry_run, force_mock):
                             sent_at = datetime('now','localtime')
                         WHERE id = ?
                     """, (msg, new_retry, effective_max, 1 if is_mock else 0, prov, msg_id, r["id"]))
+                    if batch_id:
+                        conn.execute("UPDATE batch_members SET notice_status='发送失败' WHERE batch_id=? AND arrear_id=?",
+                                     (batch_id, r["arrear_id"]))
                     fail += 1
             else:
                 success += ok
@@ -434,6 +471,9 @@ def retry_failed(record_id, retry_all, max_retry, force, dry_run, force_mock):
             progress.advance(task)
 
     if not dry_run:
+        if batch_id:
+            from .batch_cmd import _refresh_batch_stats
+            _refresh_batch_stats(conn, batch_id)
         conn.commit()
     conn.close()
     console.print(f"\n[green]成功: {success}[/green], [red]失败: {fail}[/red]")

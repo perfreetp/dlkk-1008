@@ -41,6 +41,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if not col_exists("arrears", "original_total"):
         cursor.execute("ALTER TABLE arrears ADD COLUMN original_total REAL DEFAULT 0")
 
+    if not col_exists("arrears", "paid_amount"):
+        cursor.execute("ALTER TABLE arrears ADD COLUMN paid_amount REAL NOT NULL DEFAULT 0")
+
+    if not col_exists("arrears", "discount_amount"):
+        cursor.execute("ALTER TABLE arrears ADD COLUMN discount_amount REAL NOT NULL DEFAULT 0")
+
     if not table_exists("payment_records"):
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS payment_records (
@@ -60,6 +66,106 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     if not col_exists("discount_records", "remark"):
         cursor.execute("ALTER TABLE discount_records ADD COLUMN remark TEXT")
+
+    if not col_exists("notice_records", "batch_id"):
+        cursor.execute("ALTER TABLE notice_records ADD COLUMN batch_id INTEGER")
+
+    if not table_exists("pending_payments"):
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trans_no TEXT,
+                trans_date TEXT,
+                payer_name TEXT,
+                payer_phone TEXT,
+                payer_account TEXT,
+                amount REAL NOT NULL DEFAULT 0,
+                remark TEXT,
+                match_status TEXT DEFAULT '待匹配',
+                match_score INTEGER DEFAULT 0,
+                matched_household_id INTEGER,
+                matched_arrear_id INTEGER,
+                matched_room TEXT,
+                operator TEXT,
+                raw_data TEXT,
+                source_file TEXT,
+                created_at TEXT DEFAULT (datetime('now','localtime')),
+                updated_at TEXT DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (matched_household_id) REFERENCES households(id) ON DELETE SET NULL,
+                FOREIGN KEY (matched_arrear_id) REFERENCES arrears(id) ON DELETE SET NULL
+            )
+        """)
+
+    if not table_exists("batches"):
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT NOT NULL UNIQUE,
+                batch_name TEXT NOT NULL,
+                batch_type TEXT DEFAULT '短信',
+                description TEXT,
+                status TEXT DEFAULT '草稿',
+                target_count INTEGER DEFAULT 0,
+                sent_count INTEGER DEFAULT 0,
+                success_count INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0,
+                call_count INTEGER DEFAULT 0,
+                promised_count INTEGER DEFAULT 0,
+                repaid_count INTEGER DEFAULT 0,
+                repaid_amount REAL DEFAULT 0,
+                created_by TEXT,
+                created_at TEXT DEFAULT (datetime('now','localtime')),
+                closed_at TEXT
+            )
+        """)
+
+    if not table_exists("batch_members"):
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS batch_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                household_id INTEGER NOT NULL,
+                arrear_id INTEGER,
+                room_no TEXT,
+                owner_name TEXT,
+                unpaid_amount REAL DEFAULT 0,
+                notice_status TEXT DEFAULT '未发送',
+                call_status TEXT DEFAULT '未联系',
+                commitment_status TEXT DEFAULT '未承诺',
+                repayment_status TEXT DEFAULT '未回款',
+                repayment_amount REAL DEFAULT 0,
+                remark TEXT,
+                created_at TEXT DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE,
+                FOREIGN KEY (household_id) REFERENCES households(id) ON DELETE CASCADE,
+                FOREIGN KEY (arrear_id) REFERENCES arrears(id) ON DELETE SET NULL,
+                UNIQUE(batch_id, arrear_id, household_id)
+            )
+        """)
+
+    if not table_exists("audit_exceptions"):
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS audit_exceptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                check_time TEXT DEFAULT (datetime('now','localtime')),
+                exception_type TEXT NOT NULL,
+                arrear_id INTEGER,
+                room_no TEXT,
+                fee_period TEXT,
+                description TEXT,
+                base_amount REAL DEFAULT 0,
+                late_fee REAL DEFAULT 0,
+                paid_amount REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                unpaid_amount REAL DEFAULT 0,
+                diff_amount REAL DEFAULT 0,
+                handle_status TEXT DEFAULT '待处理',
+                handle_remark TEXT,
+                handled_by TEXT,
+                handled_at TEXT,
+                FOREIGN KEY (arrear_id) REFERENCES arrears(id) ON DELETE SET NULL
+            )
+        """)
 
     sms_configs = [
         ("sms_provider", ""),

@@ -5,7 +5,7 @@ from rich.table import Table
 from typing import Optional
 
 from ..database import get_connection
-from ..utils import parse_date, format_money, is_holiday, count_workdays, get_config, set_config
+from ..utils import parse_date, format_money, is_holiday, count_workdays, get_config, set_config, UNPAID_SQL_EXPR
 
 console = Console()
 
@@ -37,13 +37,13 @@ def calc_late_fee(building, room, period, rate, grace_days, skip_holidays, to_da
         return
 
     conn = get_connection()
-    sql = """
+    sql = f"""
         SELECT a.id, a.household_id, a.fee_period, a.fee_type, a.base_amount,
                a.late_fee as current_late_fee, a.due_date, a.status,
+               a.paid_amount, a.discount_amount,
                h.room_no, h.building, h.owner_name
         FROM arrears a JOIN households h ON a.household_id = h.id
-        WHERE (a.total_amount - a.paid_amount - a.discount_amount) > 0
-          AND a.status NOT IN ('已缴', '减免')
+        WHERE {UNPAID_SQL_EXPR} > 0
     """
     params = []
     if building:
@@ -155,14 +155,16 @@ def calc_late_fee(building, room, period, rate, grace_days, skip_holidays, to_da
         return
 
     try:
+        from .record_cmd import _refresh_arrear_status, _sync_batch_after_change
         for r in results:
             conn.execute("""
                 UPDATE arrears SET
                     late_fee = ?,
-                    total_amount = base_amount + ? - discount_amount,
                     updated_at = datetime('now','localtime')
                 WHERE id = ?
-            """, (r["new_late"], r["new_late"], r["id"]))
+            """, (r["new_late"], r["id"]))
+            _refresh_arrear_status(conn, r["id"])
+            _sync_batch_after_change(conn, r["id"], "discount" if False else "", "滞纳金更新")
         conn.commit()
         console.print("[green]滞纳金已更新[/green]")
     except Exception as e:

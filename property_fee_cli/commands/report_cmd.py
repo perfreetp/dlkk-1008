@@ -238,136 +238,233 @@ def building_summary(output, encoding):
         console.print(f"\n[green]汇总表已导出到 {output}[/green]")
 
 
-@report_cmd.command("history", help="查询历史催缴记录")
+@report_cmd.command("history", help="查询历史催缴记录（完整时间线：短信/电话/承诺/减免/缴费）")
 @click.option("--room", "-r", "room_no", help="按房号查询")
 @click.option("--building", "-b", help="按楼栋查询")
 @click.option("--from-date", help="起始日期 YYYY-MM-DD")
 @click.option("--to-date", help="结束日期 YYYY-MM-DD")
-@click.option("--type", "rtype", type=click.Choice(["短信", "电话", "全部"]), default="全部", help="记录类型")
+@click.option("--type", "rtype", type=click.Choice(["短信", "电话", "减免", "缴费", "全部"]), default="全部", help="记录类型")
 @click.option("--output", "-o", type=click.Path(writable=True), help="导出CSV")
-@click.option("--limit", "-n", type=int, default=100, help="显示条数")
+@click.option("--limit", "-n", type=int, default=200, help="显示条数")
 @click.option("--hide-sensitive/--show-sensitive", default=None)
 def query_history(room_no, building, from_date, to_date, rtype, output, limit, hide_sensitive):
     hide = hide_sensitive if hide_sensitive is not None else should_hide_sensitive()
     conn = get_connection()
 
-    notice_rows, call_rows = [], []
+    events: list = []
+    room_where = ""
+    bld_where = ""
+    params_common: list = []
+    if room_no:
+        room_where = " AND h.room_no LIKE ?"
+        params_common.append(f"%{room_no}%")
+    if building:
+        bld_where = " AND h.building LIKE ?"
+        params_common.append(f"%{building}%")
+    date_where_from = ""
+    date_where_to = ""
+    if from_date:
+        date_where_from = " AND DATE({timecol}) >= ?"
+    if to_date:
+        date_where_to = " AND DATE({timecol}) <= ?"
+
+    def _limit_date(sql: str, timecol: str) -> str:
+        s = sql.replace("{timecol}", timecol)
+        return s
 
     if rtype in ("短信", "全部"):
-        sql = """
-            SELECT '短信' as rtype, nr.created_at as event_time, h.room_no, h.building,
+        sql = f"""
+            SELECT '短信' as event_type, nr.created_at as event_time, h.room_no, h.building,
                    h.owner_name, nr.phone, nr.channel, nr.status,
-                   nr.content as detail, nr.sent_at, '' as extra1, '' as extra2,
-                   nr.is_mock as is_mock
+                   nr.content as detail, nr.sent_at,
+                   '' as amount, '' as amount_change,
+                   nr.is_mock as is_mock, '' as extra
             FROM notice_records nr JOIN households h ON nr.household_id = h.id
-            WHERE 1=1
+            WHERE 1=1 {room_where} {bld_where}
+            {_limit_date(date_where_from, 'nr.created_at') if from_date else ''}
+            {_limit_date(date_where_to, 'nr.created_at') if to_date else ''}
+            ORDER BY nr.created_at DESC LIMIT ?
         """
-        params = []
-        if room_no:
-            sql += " AND h.room_no LIKE ?"
-            params.append(f"%{room_no}%")
-        if building:
-            sql += " AND h.building LIKE ?"
-            params.append(f"%{building}%")
-        if from_date:
-            sql += " AND DATE(nr.created_at) >= ?"
-            params.append(from_date)
-        if to_date:
-            sql += " AND DATE(nr.created_at) <= ?"
-            params.append(to_date)
-        sql += " ORDER BY nr.created_at DESC LIMIT ?"
+        params = params_common[:]
+        if from_date: params.append(from_date)
+        if to_date: params.append(to_date)
         params.append(limit)
-        notice_rows = conn.execute(sql, params).fetchall()
+        for r in conn.execute(sql, params).fetchall():
+            events.append(dict(r))
 
     if rtype in ("电话", "全部"):
-        sql = """
-            SELECT '电话' as rtype, cr.call_time as event_time, h.room_no, h.building,
+        sql = f"""
+            SELECT '电话' as event_type, cr.call_time as event_time, h.room_no, h.building,
                    h.owner_name, h.phone, '电话' as channel, cr.call_result as status,
-                   cr.remark as detail, '' as sent_at,
-                   COALESCE(cr.commitment_date, '') as extra1,
-                   CASE WHEN cr.commitment_amount > 0 THEN printf('%.2f', cr.commitment_amount) ELSE '' END as extra2,
-                   NULL as is_mock
+                   COALESCE(cr.remark, '') as detail, '' as sent_at,
+                   '' as amount, '' as amount_change,
+                   NULL as is_mock,
+                   CASE WHEN cr.commitment_date IS NOT NULL AND cr.commitment_date != ''
+                        THEN '承诺:'||cr.commitment_date||
+                             CASE WHEN cr.commitment_amount > 0 THEN ' '||printf('%.2f',cr.commitment_amount)||'元' ELSE '' END
+                        ELSE '' END as extra
             FROM call_records cr JOIN households h ON cr.household_id = h.id
-            WHERE 1=1
+            WHERE 1=1 {room_where} {bld_where}
+            {_limit_date(date_where_from, 'cr.call_time') if from_date else ''}
+            {_limit_date(date_where_to, 'cr.call_time') if to_date else ''}
+            ORDER BY cr.call_time DESC LIMIT ?
         """
-        params = []
-        if room_no:
-            sql += " AND h.room_no LIKE ?"
-            params.append(f"%{room_no}%")
-        if building:
-            sql += " AND h.building LIKE ?"
-            params.append(f"%{building}%")
-        if from_date:
-            sql += " AND DATE(cr.call_time) >= ?"
-            params.append(from_date)
-        if to_date:
-            sql += " AND DATE(cr.call_time) <= ?"
-            params.append(to_date)
-        sql += " ORDER BY cr.call_time DESC LIMIT ?"
+        params = params_common[:]
+        if from_date: params.append(from_date)
+        if to_date: params.append(to_date)
         params.append(limit)
-        call_rows = conn.execute(sql, params).fetchall()
+        for r in conn.execute(sql, params).fetchall():
+            events.append(dict(r))
+
+    if rtype in ("减免", "全部"):
+        sql = f"""
+            SELECT '费用减免' as event_type, dr.created_at as event_time, h.room_no, h.building,
+                   h.owner_name, h.phone, '减免' as channel, '已审批' as status,
+                   COALESCE(dr.discount_reason,'') || ' ' || COALESCE(dr.remark,'') as detail,
+                   COALESCE(dr.approved_at,'') as sent_at,
+                   printf('%.2f', dr.discount_amount) as amount,
+                   printf('%.2f', -dr.discount_amount) as amount_change,
+                   NULL as is_mock,
+                   '审批人:'||COALESCE(dr.approved_by,'-') as extra
+            FROM discount_records dr JOIN households h ON dr.household_id = h.id
+            WHERE 1=1 {room_where} {bld_where}
+            {_limit_date(date_where_from, 'dr.created_at') if from_date else ''}
+            {_limit_date(date_where_to, 'dr.created_at') if to_date else ''}
+            ORDER BY dr.created_at DESC LIMIT ?
+        """
+        params = params_common[:]
+        if from_date: params.append(from_date)
+        if to_date: params.append(to_date)
+        params.append(limit)
+        for r in conn.execute(sql, params).fetchall():
+            events.append(dict(r))
+
+    if rtype in ("缴费", "全部"):
+        sql = f"""
+            SELECT '缴费记录' as event_type, pr.created_at as event_time, h.room_no, h.building,
+                   h.owner_name, h.phone, COALESCE(pr.pay_method,'银行') as channel, '已登记' as status,
+                   COALESCE(pr.remark,'') as detail,
+                   COALESCE(pr.pay_date,'') as sent_at,
+                   printf('%.2f', pr.amount) as amount,
+                   printf('%.2f', -pr.amount) as amount_change,
+                   NULL as is_mock,
+                   '经办人:'||COALESCE(pr.operator,'-') as extra
+            FROM payment_records pr JOIN households h ON pr.household_id = h.id
+            WHERE 1=1 {room_where} {bld_where}
+            {_limit_date(date_where_from, 'pr.created_at') if from_date else ''}
+            {_limit_date(date_where_to, 'pr.created_at') if to_date else ''}
+            ORDER BY pr.created_at DESC LIMIT ?
+        """
+        params = params_common[:]
+        if from_date: params.append(from_date)
+        if to_date: params.append(to_date)
+        params.append(limit)
+        for r in conn.execute(sql, params).fetchall():
+            events.append(dict(r))
+
+    if rtype == "全部":
+        sql = f"""
+            SELECT '欠费产生' as event_type, a.created_at as event_time, h.room_no, h.building,
+                   h.owner_name, h.phone, a.fee_type as channel, a.status as status,
+                   '账期:'||a.fee_period||' 本金:'||printf('%.2f',a.base_amount) as detail,
+                   a.due_date as sent_at,
+                   printf('%.2f', a.base_amount + COALESCE(a.late_fee,0)) as amount,
+                   printf('%.2f', a.base_amount + COALESCE(a.late_fee,0)) as amount_change,
+                   NULL as is_mock,
+                   '应缴日:'||COALESCE(a.due_date,'') as extra
+            FROM arrears a JOIN households h ON a.household_id = h.id
+            WHERE 1=1 {room_where} {bld_where}
+            {_limit_date(date_where_from, 'a.created_at') if from_date else ''}
+            {_limit_date(date_where_to, 'a.created_at') if to_date else ''}
+            ORDER BY a.created_at DESC LIMIT ?
+        """
+        params = params_common[:]
+        if from_date: params.append(from_date)
+        if to_date: params.append(to_date)
+        params.append(limit)
+        for r in conn.execute(sql, params).fetchall():
+            events.append(dict(r))
 
     conn.close()
 
-    all_rows = list(notice_rows) + list(call_rows)
-    all_rows.sort(key=lambda r: r["event_time"], reverse=True)
-    all_rows = all_rows[:limit]
+    events.sort(key=lambda r: r["event_time"] or "", reverse=True)
+    events = events[:limit]
 
-    if not all_rows:
+    if not events:
         console.print("[yellow]未找到历史记录[/yellow]")
         return
 
-    table = Table(title=f"催缴历史记录（共 {len(all_rows)} 条）")
+    table = Table(title=f"催缴历史记录（完整时间线，共 {len(events)} 条）")
     table.add_column("时间", style="white", no_wrap=True)
     table.add_column("类型", style="cyan")
+    table.add_column("金额变化", justify="right", style="yellow")
     table.add_column("真实/模拟", style="white")
     table.add_column("房号", style="green")
     table.add_column("业主", style="magenta")
-    table.add_column("联系方式", style="yellow")
+    table.add_column("渠道", style="white")
     table.add_column("状态/结果", style="white")
-    table.add_column("详情", style="white")
+    table.add_column("详情", style="white", max_width=40)
+    table.add_column("补充", style="dim")
 
-    for r in all_rows:
+    type_colors = {
+        "欠费产生": "red", "短信": "cyan", "电话": "blue",
+        "费用减免": "magenta", "缴费记录": "green",
+    }
+
+    for r in events:
         name = mask_name(r["owner_name"]) if hide else r["owner_name"]
-        phone = mask_phone(r["phone"]) if hide else (r["phone"] or "-")
-        detail = (r["detail"] or "")[:40]
-        if r["rtype"] == "电话" and r["extra1"]:
-            detail += f" | 承诺:{r['extra1']}"
-            if r["extra2"]:
-                detail += f" {r['extra2']}元"
-        rtype_style = "cyan" if r["rtype"] == "短信" else "blue"
-        status_style = {"已发送": "green", "发送失败": "red"}.get(r["status"], "white")
-        if r["is_mock"] is None:
+        phone_str = r.get("phone") or ""
+        if hide and phone_str:
+            phone_str = mask_phone(phone_str)
+        detail = (r.get("detail") or "")[:36]
+        if r.get("extra"):
+            detail += " | " + str(r["extra"])[:20]
+        rtype_style = type_colors.get(r["event_type"], "white")
+        status = r.get("status") or "-"
+        status_style = {"已发送": "green", "发送失败": "red", "已联系/承诺付款": "green",
+                        "已审批": "magenta", "已登记": "green"}.get(status, "white")
+        is_mock = r.get("is_mock")
+        if is_mock is None:
             mock_label = "-"
             mock_style = "dim"
         else:
-            mock_label = "模拟" if r["is_mock"] else "真实"
-            mock_style = "yellow" if r["is_mock"] else "green"
+            mock_label = "模拟" if is_mock else "真实"
+            mock_style = "yellow" if is_mock else "green"
+        amt_change = r.get("amount_change") or ""
+        amt_color = "green" if amt_change and str(amt_change).startswith("-") else ("red" if amt_change else "white")
         table.add_row(
-            r["event_time"], f"[{rtype_style}]{r['rtype']}[/{rtype_style}]",
+            r["event_time"],
+            f"[{rtype_style}]{r['event_type']}[/{rtype_style}]",
+            f"[{amt_color}]{amt_change}[/{amt_color}]" if amt_change else "-",
             f"[{mock_style}]{mock_label}[/{mock_style}]",
-            r["room_no"], name, phone,
-            f"[{status_style}]{r['status']}[/{status_style}]",
-            detail + ("..." if len(r["detail"] or "") > 40 else ""),
+            r["room_no"], name,
+            r.get("channel") or "-",
+            f"[{status_style}]{status}[/{status_style}]",
+            detail + ("..." if len((r.get("detail") or "")) > 36 else ""),
+            (r.get("sent_at") or "")[:10] if r.get("sent_at") else "",
         )
     console.print(table)
 
     if output:
         with open(output, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["时间", "类型", "真实/模拟", "房号", "楼栋", "业主", "联系方式", "状态", "详情", "承诺日期", "承诺金额"])
-            for r in all_rows:
+            writer.writerow(["时间", "事件类型", "金额", "金额变化", "真实/模拟", "房号", "楼栋", "业主",
+                             "联系方式", "渠道", "状态", "详情", "补充信息"])
+            for r in events:
                 name = mask_name(r["owner_name"]) if hide else r["owner_name"]
-                phone = mask_phone(r["phone"]) if hide else (r["phone"] or "")
-                if r["is_mock"] is None:
-                    mock_label = "-"
-                else:
-                    mock_label = "模拟" if r["is_mock"] else "真实"
+                phone_str = r.get("phone") or ""
+                if hide and phone_str:
+                    phone_str = mask_phone(phone_str)
+                is_mock = r.get("is_mock")
+                mock_txt = "" if is_mock is None else ("模拟" if is_mock else "真实")
                 writer.writerow([
-                    r["event_time"], r["rtype"], mock_label, r["room_no"], r["building"], name, phone,
-                    r["status"], r["detail"] or "", r["extra1"] or "", r["extra2"] or "",
+                    r["event_time"], r["event_type"],
+                    r.get("amount") or "", r.get("amount_change") or "",
+                    mock_txt, r["room_no"], r.get("building") or "", name, phone_str,
+                    r.get("channel") or "", r.get("status") or "",
+                    r.get("detail") or "", r.get("extra") or "",
                 ])
-        console.print(f"\n[green]历史记录已导出到 {output}[/green]")
+        console.print(f"[green]✓ 已导出到 {output}[/green]")
 
 
 @report_cmd.command("dashboard", help="催缴工作总览仪表盘")

@@ -8,7 +8,8 @@ from typing import Optional, Dict, Any
 from ..database import get_connection
 from ..utils import (
     mask_phone, mask_name, should_hide_sensitive, format_money,
-    is_holiday, next_workday, get_config, get_sms_signature, calc_unpaid
+    is_holiday, next_workday, get_config, get_sms_signature, calc_unpaid,
+    UNPAID_SQL_EXPR,
 )
 
 console = Console()
@@ -175,7 +176,7 @@ def preview_notice(building, room, period, template_id, template_name, unpaid_on
         sql += " AND a.fee_period LIKE ?"
         params.append(f"%{period}%")
     if unpaid_only:
-        sql += " AND (a.total_amount - a.paid_amount - a.discount_amount) > 0"
+        sql += f" AND {UNPAID_SQL_EXPR} > 0"
     sql += " ORDER BY h.building, h.room_no LIMIT ?"
     params.append(limit)
 
@@ -200,7 +201,8 @@ def preview_notice(building, room, period, template_id, template_name, unpaid_on
         content = _render_template(tpl["content"], vars)
         display_phone = vars["phone"] or "[red]无手机号[/red]"
         title = f"[cyan]{r['room_no']}[/cyan] · {vars['owner_name']} · [yellow]{display_phone}[/yellow]"
-        console.print(Panel(content, title=title, border_style="green", expand=False, subtitle=f"账期: {r['fee_period']}  尚欠: {format_money(r['total_amount'] - r['paid_amount'] - r['discount_amount'])}元"))
+        unpaid_show = calc_unpaid(r["base_amount"], r["late_fee"], r["paid_amount"], r["discount_amount"])
+        console.print(Panel(content, title=title, border_style="green", expand=False, subtitle=f"账期: {r['fee_period']}  尚欠: {format_money(unpaid_show)}元"))
         console.print()
 
 
@@ -213,7 +215,8 @@ def preview_notice(building, room, period, template_id, template_name, unpaid_on
 @click.option("--channel", default="短信", help="发送渠道，默认短信")
 @click.option("--max-retry", type=int, default=3, help="失败最大重试次数")
 @click.option("--dry-run", is_flag=True, help="仅预览不写入")
-def generate_notice(building, room, period, template_id, min_amount, channel, max_retry, dry_run):
+@click.option("--batch", "batch_id", type=int, default=None, help="关联到指定批次ID")
+def generate_notice(building, room, period, template_id, min_amount, channel, max_retry, dry_run, batch_id):
     conn = get_connection()
 
     if template_id:
@@ -225,13 +228,26 @@ def generate_notice(building, room, period, template_id, min_amount, channel, ma
         conn.close()
         return
 
-    sql = """
-        SELECT a.*, h.room_no, h.building, h.owner_name, h.phone
+    if batch_id:
+        ba = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        if not ba:
+            console.print(f"[red]批次ID {batch_id} 不存在[/red]")
+            conn.close()
+            return
+        if ba["status"] and ba["status"] not in ("草稿", "进行中"):
+            console.print(f"[yellow]⚠ 批次 {ba['batch_name']} 已是'{ba['status']}'，可能已归档[/yellow]")
+
+    sql = f"""
+        SELECT a.*, h.room_no, h.building, h.owner_name, h.phone,
+               {UNPAID_SQL_EXPR} as unpaid_calc
         FROM arrears a JOIN households h ON a.household_id = h.id
-        WHERE (a.total_amount - a.paid_amount - a.discount_amount) > 0
+        WHERE {UNPAID_SQL_EXPR} > 0
           AND h.phone IS NOT NULL AND h.phone != ''
     """
     params = []
+    if batch_id:
+        sql += " AND a.id IN (SELECT arrear_id FROM batch_members WHERE batch_id = ? AND arrear_id IS NOT NULL)"
+        params.append(batch_id)
     if building:
         sql += " AND h.building LIKE ?"
         params.append(f"%{building}%")
@@ -242,7 +258,7 @@ def generate_notice(building, room, period, template_id, min_amount, channel, ma
         sql += " AND a.fee_period LIKE ?"
         params.append(f"%{period}%")
     if min_amount:
-        sql += " AND (a.total_amount - a.paid_amount - a.discount_amount) >= ?"
+        sql += f" AND {UNPAID_SQL_EXPR} >= ?"
         params.append(min_amount)
     sql += " ORDER BY h.building, h.room_no"
 
@@ -261,7 +277,7 @@ def generate_notice(building, room, period, template_id, min_amount, channel, ma
         table.add_column("账期", style="white")
         table.add_column("尚欠", justify="right", style="bold red")
         for r in rows[:20]:
-            unpaid = r["total_amount"] - r["paid_amount"] - r["discount_amount"]
+            unpaid = calc_unpaid(r["base_amount"], r["late_fee"], r["paid_amount"], r["discount_amount"])
             phone = mask_phone(r["phone"]) if should_hide_sensitive() else r["phone"]
             name = mask_name(r["owner_name"]) if should_hide_sensitive() else r["owner_name"]
             table.add_row(r["room_no"], name, phone, r["fee_period"], format_money(unpaid))
@@ -277,23 +293,41 @@ def generate_notice(building, room, period, template_id, min_amount, channel, ma
 
     generated = 0
     skipped = 0
+    from ..utils import is_sms_real_configured
+    real_cfg = is_sms_real_configured()
+    is_mock_val = 0 if real_cfg else 1
+    provider_val = conn.execute("SELECT value FROM config WHERE key='sms_provider'").fetchone()
+    provider = (provider_val["value"] if provider_val and provider_val["value"] else "mock") if real_cfg else "mock"
+
     for r in rows:
         vars = _build_template_vars(r, hide_sensitive=False)
         content = _render_template(tpl["content"], vars)
         try:
-            conn.execute("""
+            cur = conn.execute("""
                 INSERT INTO notice_records
-                (arrear_id, household_id, channel, template_name, content, phone, status, retry_count, max_retry)
-                VALUES (?, ?, ?, ?, ?, ?, '待发送', 0, ?)
-            """, (r["id"], r["household_id"], channel, tpl["name"], content, r["phone"], max_retry))
+                (arrear_id, household_id, channel, template_name, content, phone, status, retry_count, max_retry, is_mock, provider, batch_id)
+                VALUES (?, ?, ?, ?, ?, ?, '待发送', 0, ?, ?, ?, ?)
+            """, (r["id"], r["household_id"], channel, tpl["name"], content, r["phone"], max_retry, is_mock_val, provider, batch_id))
+            notice_id = cur.lastrowid
+            if batch_id:
+                conn.execute("""
+                    UPDATE batch_members SET notice_status='待发送'
+                    WHERE batch_id=? AND arrear_id=?
+                """, (batch_id, r["id"]))
             generated += 1
         except Exception as e:
             skipped += 1
             console.print(f"[yellow]跳过 {r['room_no']}: {e}[/yellow]")
 
+    if batch_id:
+        from .batch_cmd import _refresh_batch_stats
+        _refresh_batch_stats(conn, batch_id)
+
     conn.commit()
     conn.close()
     console.print(f"[green]已生成 {generated} 条待发送通知[/green]，跳过 {skipped} 条")
+    if batch_id:
+        console.print(f"批次ID={batch_id} 已关联")
 
 
 @notice_cmd.command("queue", help="查看待发送队列")

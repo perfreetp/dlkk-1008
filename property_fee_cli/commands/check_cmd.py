@@ -1,8 +1,9 @@
 import click
 import csv
+from datetime import datetime
 from rich.console import Console
 from rich.table import Table
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from collections import OrderedDict
 
 from ..database import get_connection
@@ -11,7 +12,7 @@ from ..utils import calc_unpaid, format_money, UNPAID_SQL_EXPR
 console = Console()
 
 
-@click.group(help="数据校验命令组 - 检查欠费数据异常")
+@click.group(help="数据校验命令组 - 检查欠费数据异常并标记处理")
 def check_cmd():
     pass
 
@@ -28,14 +29,13 @@ ANOMALY_TYPES = OrderedDict([
 
 AUTO_FIXABLE = {"paid_but_unpaid", "unpaid_but_clear", "total_mismatch"}
 
-
-def _raw_unpaid(base: float, late: float, paid: float, discount: float) -> float:
-    return round(float(base or 0) + float(late or 0) - float(paid or 0) - float(discount or 0), 2)
+HANDLE_STATUS_OPTIONS = ["待处理", "已确认", "已修复", "暂缓处理"]
 
 
-def _build_base_table(title: str) -> Table:
+def _build_base_table(title: str, show_handle_cols: bool = False) -> Table:
     t = Table(title=title)
-    t.add_column("ID", style="dim", no_wrap=True)
+    t.add_column("异常ID", style="dim", no_wrap=True)
+    t.add_column("欠费ID", style="white", no_wrap=True)
     t.add_column("房号", style="cyan")
     t.add_column("业主", style="white")
     t.add_column("账期", style="white")
@@ -43,23 +43,23 @@ def _build_base_table(title: str) -> Table:
     t.add_column("滞纳金", justify="right", style="yellow")
     t.add_column("已缴", justify="right", style="green")
     t.add_column("减免", justify="right", style="magenta")
-    t.add_column("总额", justify="right", style="white")
+    t.add_column("尚欠", justify="right", style="bold red")
     t.add_column("状态", style="white")
+    t.add_column("说明", style="bold red")
+    if show_handle_cols:
+        t.add_column("处理状态", style="yellow")
+        t.add_column("处理备注", style="dim", max_width=20)
+        t.add_column("处理人/时间", style="dim", max_width=20)
     return t
 
 
-def _add_row(t: Table, r: Any, extra: str = "") -> None:
-    t.add_row(
-        str(r["id"]), r["room_no"], r["owner_name"] or "",
-        r["fee_period"], format_money(r["base_amount"]), format_money(r["late_fee"]),
-        format_money(r["paid_amount"]), format_money(r["discount_amount"]),
-        format_money(r["total_amount"]), r["status"], extra)
-
-
-@check_cmd.command("audit", help="扫描所有欠费记录，检查数据异常")
+@check_cmd.command("audit", help="扫描所有欠费记录，检查数据异常并持久化")
 @click.option("--output", "-o", "output_file", help="导出异常清单到CSV文件")
 @click.option("--auto-fix", is_flag=True, help="自动修复第3/4/5类异常")
-def audit(output_file: str, auto_fix: bool):
+@click.option("--reset-handle", is_flag=True, help="重置已标记的处理状态为待处理")
+@click.option("--show-handled", is_flag=True, help="终端显示时包含已确认/已修复的记录")
+@click.option("--operator", default="系统扫描", help="扫描操作人")
+def audit(output_file: Optional[str], auto_fix: bool, reset_handle: bool, show_handled: bool, operator: str):
     conn = get_connection()
 
     sql = f"""
@@ -77,7 +77,8 @@ def audit(output_file: str, auto_fix: bool):
         conn.close()
         return
 
-    anomalies: Dict[str, List[Any]] = {k: [] for k in ANOMALY_TYPES}
+    anomalies_all: List[Dict[str, Any]] = []
+    scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for r in rows:
         base = float(r["base_amount"] or 0)
@@ -89,25 +90,21 @@ def audit(output_file: str, auto_fix: bool):
         unpaid = calc_unpaid(base, late, paid, discount)
         raw_unpaid = round(base + late - paid - discount, 2)
         expected_total = round(base + late - discount, 2)
+        diff_amt = round(total - expected_total, 2)
 
+        hit_list = []
         if raw_unpaid < -0.01:
-            anomalies["negative_unpaid"].append(r)
-
+            hit_list.append(("negative_unpaid", f"尚欠={format_money(raw_unpaid)}", raw_unpaid))
         if discount > base + late + 0.01:
-            anomalies["discount_exceed"].append(r)
-
+            hit_list.append(("discount_exceed", f"减免{format_money(discount)} > 应缴{format_money(base+late)}", round(discount - base - late, 2)))
         if status == "已缴" and unpaid > 0.01:
-            anomalies["paid_but_unpaid"].append(r)
-
+            hit_list.append(("paid_but_unpaid", f"尚欠={format_money(unpaid)}", unpaid))
         if status != "已缴" and unpaid <= 0.01:
-            anomalies["unpaid_but_clear"].append(r)
-
+            hit_list.append(("unpaid_but_clear", f"尚欠={format_money(unpaid)}", -unpaid))
         if abs(total - expected_total) > 0.01:
-            anomalies["total_mismatch"].append(r)
-
+            hit_list.append(("total_mismatch", f"总额{format_money(total)} ≠ 应为{format_money(expected_total)}", diff_amt))
         if paid + discount > base + late + 0.01:
-            anomalies["over_paid"].append(r)
-
+            hit_list.append(("over_paid", f"已缴+减免={format_money(paid+discount)} > 原应缴{format_money(base+late)}", round(paid + discount - base - late, 2)))
         if status == "承诺付款":
             cr = conn.execute(
                 "SELECT id FROM call_records WHERE arrear_id = ? AND (commitment_date IS NOT NULL OR commitment_amount > 0 OR call_result LIKE ?)",
@@ -119,102 +116,183 @@ def audit(output_file: str, auto_fix: bool):
                     (r["household_id"], "%承诺%")
                 ).fetchone()
                 if not cr2:
-                    anomalies["promise_no_contact"].append(r)
+                    hit_list.append(("promise_no_contact", "无承诺通话记录", 0.0))
 
+        for ex_type, desc, diff in hit_list:
+            anomalies_all.append({
+                "check_time": scan_time,
+                "exception_type": ex_type,
+                "arrear_id": r["id"],
+                "room_no": r["room_no"],
+                "fee_period": r["fee_period"],
+                "description": desc,
+                "base_amount": base,
+                "late_fee": late,
+                "paid_amount": paid,
+                "discount_amount": discount,
+                "unpaid_amount": unpaid,
+                "diff_amount": round(diff, 2),
+                "owner_name": r["owner_name"] or "",
+                "old_status": r["status"] or "",
+            })
+
+    for ae in anomalies_all:
+        existing = conn.execute("""
+            SELECT id, handle_status, handle_remark, handled_by, handled_at
+            FROM audit_exceptions
+            WHERE arrear_id = ? AND exception_type = ? AND handle_status != '已修复'
+            ORDER BY id DESC LIMIT 1
+        """, (ae["arrear_id"], ae["exception_type"])).fetchone()
+
+        if reset_handle:
+            conn.execute("DELETE FROM audit_exceptions WHERE arrear_id = ? AND exception_type = ?",
+                         (ae["arrear_id"], ae["exception_type"]))
+            existing = None
+
+        if existing:
+            ae["handle_status"] = existing["handle_status"] or "待处理"
+            ae["handle_remark"] = existing["handle_remark"] or ""
+            ae["handled_by"] = existing["handled_by"] or ""
+            ae["handled_at"] = existing["handled_at"] or ""
+            conn.execute("""
+                UPDATE audit_exceptions SET
+                    check_time = ?, description = ?,
+                    base_amount = ?, late_fee = ?, paid_amount = ?, discount_amount = ?,
+                    unpaid_amount = ?, diff_amount = ?
+                WHERE id = ?
+            """, (scan_time, ae["description"],
+                  ae["base_amount"], ae["late_fee"], ae["paid_amount"], ae["discount_amount"],
+                  ae["unpaid_amount"], ae["diff_amount"], existing["id"]))
+            ae["exception_id"] = existing["id"]
+        else:
+            cur = conn.execute("""
+                INSERT INTO audit_exceptions
+                (check_time, exception_type, arrear_id, room_no, fee_period, description,
+                 base_amount, late_fee, paid_amount, discount_amount, unpaid_amount, diff_amount,
+                 handle_status, handle_remark)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?, '待处理', '')
+            """, (
+                scan_time, ae["exception_type"], ae["arrear_id"], ae["room_no"], ae["fee_period"],
+                ae["description"], ae["base_amount"], ae["late_fee"], ae["paid_amount"],
+                ae["discount_amount"], ae["unpaid_amount"], ae["diff_amount"],
+            ))
+            ae["exception_id"] = cur.lastrowid
+            ae["handle_status"] = "待处理"
+            ae["handle_remark"] = ""
+            ae["handled_by"] = ""
+            ae["handled_at"] = ""
+
+    conn.commit()
     conn.close()
 
-    total_anomaly_count = sum(len(v) for v in anomalies.values())
-    console.print(f"[bold]扫描完成:[/bold] 共 {len(rows)} 条欠费记录，发现 [red]{total_anomaly_count}[/red] 条异常")
+    total_anomaly_count = len(anomalies_all)
+    display_anomalies = [a for a in anomalies_all if show_handled or a["handle_status"] == "待处理"]
+
+    console.print(f"[bold]扫描完成:[/bold] 共 {len(rows)} 条欠费记录，发现 [red]{total_anomaly_count}[/red] 条异常（含历史），当前待处理 [yellow]{sum(1 for a in anomalies_all if a['handle_status']=='待处理')}[/yellow] 条")
 
     if total_anomaly_count == 0:
         console.print("[green]数据校验通过，未发现异常[/green]")
         return
 
+    grouped: Dict[str, List[Dict[str, Any]]] = {k: [] for k in ANOMALY_TYPES}
+    for a in anomalies_all:
+        grouped.setdefault(a["exception_type"], []).append(a)
+
     summary_rows = []
     csv_rows = []
 
     for key, label in ANOMALY_TYPES.items():
-        records = anomalies[key]
+        records = grouped.get(key, [])
         if not records:
             continue
+        show_recs = [r for r in records if show_handled or r["handle_status"] == "待处理"]
+        if not show_recs:
+            summary_rows.append((label, len(records), key in AUTO_FIXABLE, 0, 0))
+            continue
         console.print()
-        table_title = f"【{label}】共 {len(records)} 条"
-        t = _build_base_table(table_title)
-        t.add_column("说明", style="bold red")
+        t = _build_base_table(f"【{label}】共 {len(records)} 条 （显示{len(show_recs)}条待处理）", show_handle_cols=True)
+        fixable_mark = " [green]✓可修复[/green]" if key in AUTO_FIXABLE else ""
+        handled_count = sum(1 for r in records if r["handle_status"] != "待处理")
+        summary_rows.append((label, len(records), key in AUTO_FIXABLE, handled_count, len(records) - handled_count))
 
-        for r in records:
-            base = float(r["base_amount"] or 0)
-            late = float(r["late_fee"] or 0)
-            paid = float(r["paid_amount"] or 0)
-            discount = float(r["discount_amount"] or 0)
-            total = float(r["total_amount"] or 0)
-            unpaid = calc_unpaid(base, late, paid, discount)
-            raw_unpaid = round(base + late - paid - discount, 2)
-            expected_total = round(base + late - discount, 2)
-
-            extra = ""
-            if key == "negative_unpaid":
-                extra = f"尚欠={format_money(raw_unpaid)}"
-            elif key == "discount_exceed":
-                extra = f"减免{format_money(discount)} > 应缴{format_money(base + late)}"
-            elif key == "paid_but_unpaid":
-                extra = f"尚欠={format_money(unpaid)}"
-            elif key == "unpaid_but_clear":
-                extra = f"尚欠={format_money(unpaid)}"
-            elif key == "total_mismatch":
-                extra = f"总额{format_money(total)} ≠ 应为{format_money(expected_total)}"
-            elif key == "over_paid":
-                extra = f"已缴+减免={format_money(paid + discount)} > 原应缴{format_money(base + late)}"
-            elif key == "promise_no_contact":
-                extra = "无承诺通话记录"
-
-            _add_row(t, r, extra)
-
-            csv_rows.append({
-                "异常类型": label,
-                "ID": r["id"],
-                "房号": r["room_no"],
-                "业主": r["owner_name"] or "",
-                "账期": r["fee_period"],
-                "本金": r["base_amount"],
-                "滞纳金": r["late_fee"],
-                "已缴": r["paid_amount"],
-                "减免": r["discount_amount"],
-                "总额": r["total_amount"],
-                "状态": r["status"],
-                "说明": extra,
-            })
-
-            fixable_mark = " [green]✓可修复[/green]" if key in AUTO_FIXABLE else ""
-            summary_rows.append((label, len(records), key in AUTO_FIXABLE))
-
+        for r in show_recs:
+            status_style = {"待处理": "yellow", "已确认": "blue", "已修复": "green", "暂缓处理": "dim"}.get(r["handle_status"], "white")
+            h_info = f"{r.get('handled_by','')} {r.get('handled_at','')[:10]}".strip()
+            t.add_row(
+                str(r["exception_id"]), str(r["arrear_id"]), r["room_no"], r["owner_name"],
+                r["fee_period"], format_money(r["base_amount"]), format_money(r["late_fee"]),
+                format_money(r["paid_amount"]), format_money(r["discount_amount"]),
+                format_money(r["unpaid_amount"]), r.get("old_status") or "-",
+                r["description"],
+                f"[{status_style}]{r['handle_status']}[/{status_style}]",
+                r.get("handle_remark") or "-",
+                h_info or "-",
+            )
         console.print(t)
 
+        for r in records:
+            csv_rows.append({
+                "异常ID": r["exception_id"],
+                "异常类型": ANOMALY_TYPES.get(r["exception_type"], r["exception_type"]),
+                "欠费ID": r["arrear_id"],
+                "房号": r["room_no"],
+                "业主": r["owner_name"],
+                "账期": r["fee_period"],
+                "本金": f"{r['base_amount']:.2f}",
+                "滞纳金": f"{r['late_fee']:.2f}",
+                "已缴": f"{r['paid_amount']:.2f}",
+                "减免": f"{r['discount_amount']:.2f}",
+                "尚欠": f"{r['unpaid_amount']:.2f}",
+                "差额": f"{r['diff_amount']:.2f}",
+                "原状态": r.get("old_status", ""),
+                "说明": r["description"],
+                "扫描时间": r["check_time"],
+                "处理状态": r["handle_status"],
+                "处理备注": r.get("handle_remark") or "",
+                "处理人": r.get("handled_by") or "",
+                "处理时间": r.get("handled_at") or "",
+            })
+
     console.print()
-    summary_table = Table(title="异常汇总")
+    summary_table = Table(title="异常汇总（明细计数自动一致）")
     summary_table.add_column("异常类型", style="bold")
-    summary_table.add_column("数量", justify="right", style="white")
+    summary_table.add_column("总数", justify="right", style="white")
     summary_table.add_column("可自动修复", justify="center")
+    summary_table.add_column("已处理", justify="right", style="green")
+    summary_table.add_column("待处理", justify="right", style="yellow")
     total_fixable = 0
-    for label, count, fixable in summary_rows:
+    total_handled = 0
+    total_pending = 0
+    for label, count, fixable, handled, pending in summary_rows:
         mark = "[green]是[/green]" if fixable else "[dim]否[/dim]"
         if fixable:
             total_fixable += count
-        summary_table.add_row(label, str(count), mark)
-    summary_table.add_row("─" * 20, "─" * 6, "─" * 10, style="dim")
-    summary_table.add_row("[bold]合计[/bold]", f"[bold red]{total_anomaly_count}[/bold red]", f"[bold green]{total_fixable}[/bold green]")
+        total_handled += handled
+        total_pending += pending
+        summary_table.add_row(label, str(count), mark, str(handled), str(pending))
+    summary_table.add_row("─" * 18, "─" * 5, "─" * 8, "─" * 5, "─" * 5, style="dim")
+    summary_table.add_row("[bold]合计[/bold]",
+                          f"[bold red]{total_anomaly_count}[/bold red]",
+                          f"[bold green]{total_fixable}[/bold green]",
+                          f"[bold green]{total_handled}[/bold green]",
+                          f"[bold yellow]{total_pending}[/bold yellow]")
     console.print(summary_table)
+    if total_anomaly_count != sum(x[1] for x in summary_rows):
+        console.print(f"[red]⚠ 汇总与明细不一致：总数{total_anomaly_count} vs 分项合计{sum(x[1] for x in summary_rows)}[/red]")
+    else:
+        console.print("[dim]✓ 汇总与明细计数一致[/dim]")
 
     if output_file:
         try:
             with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.DictWriter(f, fieldnames=[
-                    "异常类型", "ID", "房号", "业主", "账期",
-                    "本金", "滞纳金", "已缴", "减免", "总额", "状态", "说明"
+                    "异常ID", "异常类型", "欠费ID", "房号", "业主", "账期",
+                    "本金", "滞纳金", "已缴", "减免", "尚欠", "差额", "原状态",
+                    "说明", "扫描时间", "处理状态", "处理备注", "处理人", "处理时间"
                 ])
                 writer.writeheader()
                 writer.writerows(csv_rows)
-            console.print(f"\n[green]异常清单已导出: {output_file}[/green]")
+            console.print(f"\n[green]异常清单已导出: {output_file} (共{len(csv_rows)}条，含处理状态)[/green]")
         except Exception as e:
             console.print(f"[red]导出CSV失败: {str(e)}[/red]")
 
@@ -222,52 +300,60 @@ def audit(output_file: str, auto_fix: bool):
         console.print(f"\n[bold yellow]开始自动修复 {total_fixable} 条异常...[/bold yellow]")
         conn = get_connection()
         fixed_count = 0
-
+        now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
-            for r in anomalies["paid_but_unpaid"]:
+            for a in anomalies_all:
+                if a["exception_type"] not in AUTO_FIXABLE:
+                    continue
+                arrear_id = a["arrear_id"]
+                r = conn.execute("SELECT * FROM arrears WHERE id = ?", (arrear_id,)).fetchone()
+                if not r:
+                    continue
                 base = float(r["base_amount"] or 0)
                 late = float(r["late_fee"] or 0)
                 paid = float(r["paid_amount"] or 0)
                 discount = float(r["discount_amount"] or 0)
                 unpaid = calc_unpaid(base, late, paid, discount)
-                new_status = "承诺付款" if unpaid > 0.01 else "未缴"
-                cr = conn.execute(
-                    "SELECT id FROM call_records WHERE arrear_id = ? AND (commitment_date IS NOT NULL OR commitment_amount > 0)",
-                    (r["id"],)
-                ).fetchone()
-                if not cr:
+
+                if a["exception_type"] == "paid_but_unpaid":
+                    new_status = "承诺付款" if unpaid > 0.01 else "未缴"
                     cr = conn.execute(
-                        "SELECT id FROM call_records WHERE household_id = ? AND (commitment_date IS NOT NULL OR commitment_amount > 0)",
-                        (r["household_id"],)
+                        "SELECT id FROM call_records WHERE arrear_id = ? AND (commitment_date IS NOT NULL OR commitment_amount > 0)",
+                        (arrear_id,)
                     ).fetchone()
-                if cr:
-                    new_status = "承诺付款"
-                conn.execute(
-                    "UPDATE arrears SET status = ?, updated_at = datetime('now','localtime') WHERE id = ?",
-                    (new_status, r["id"])
-                )
+                    if not cr:
+                        cr = conn.execute(
+                            "SELECT id FROM call_records WHERE household_id = ? AND (commitment_date IS NOT NULL OR commitment_amount > 0)",
+                            (r["household_id"],)
+                        ).fetchone()
+                    if cr:
+                        new_status = "承诺付款"
+                    conn.execute(
+                        "UPDATE arrears SET status = ?, updated_at = datetime('now','localtime') WHERE id = ?",
+                        (new_status, arrear_id)
+                    )
+                elif a["exception_type"] == "unpaid_but_clear":
+                    conn.execute(
+                        "UPDATE arrears SET status = '已缴', updated_at = datetime('now','localtime') WHERE id = ?",
+                        (arrear_id,)
+                    )
+                elif a["exception_type"] == "total_mismatch":
+                    expected_total = round(base + late - discount, 2)
+                    conn.execute(
+                        "UPDATE arrears SET total_amount = ?, updated_at = datetime('now','localtime') WHERE id = ?",
+                        (expected_total, arrear_id)
+                    )
                 fixed_count += 1
-
-            for r in anomalies["unpaid_but_clear"]:
-                conn.execute(
-                    "UPDATE arrears SET status = '已缴', updated_at = datetime('now','localtime') WHERE id = ?",
-                    (r["id"],)
-                )
-                fixed_count += 1
-
-            for r in anomalies["total_mismatch"]:
-                base = float(r["base_amount"] or 0)
-                late = float(r["late_fee"] or 0)
-                discount = float(r["discount_amount"] or 0)
-                expected_total = round(base + late - discount, 2)
-                conn.execute(
-                    "UPDATE arrears SET total_amount = ?, updated_at = datetime('now','localtime') WHERE id = ?",
-                    (expected_total, r["id"])
-                )
-                fixed_count += 1
-
+                conn.execute("""
+                    UPDATE audit_exceptions SET
+                        handle_status = '已修复',
+                        handle_remark = COALESCE(handle_remark||' | ','')||'系统自动修复',
+                        handled_by = ?,
+                        handled_at = ?
+                    WHERE id = ?
+                """, (operator, now_time, a["exception_id"]))
             conn.commit()
-            console.print(f"[green]自动修复完成，共修复 {fixed_count} 条记录[/green]")
+            console.print(f"[green]自动修复完成，共修复 {fixed_count} 条记录，异常表已标记为已修复[/green]")
         except Exception as e:
             conn.rollback()
             console.print(f"[red]修复失败: {str(e)}[/red]")
@@ -275,3 +361,150 @@ def audit(output_file: str, auto_fix: bool):
             conn.close()
     elif auto_fix and total_fixable == 0:
         console.print("\n[dim]没有可自动修复的异常[/dim]")
+
+
+@check_cmd.command("mark", help="标记异常处理状态：待处理/已确认/已修复/暂缓处理")
+@click.option("--exception-id", "exception_id", type=int, default=None, help="按异常ID标记")
+@click.option("--arrear-id", "arrear_id", type=int, default=None, help="按欠费ID批量标记该欠费的所有异常")
+@click.option("--all-of-type", "all_type", type=click.Choice(list(ANOMALY_TYPES.keys()) + list(ANOMALY_TYPES.values()) + ["all"]), default=None,
+              help="按异常类型批量标记（或'all'全部）")
+@click.option("--status", required=True, type=click.Choice(HANDLE_STATUS_OPTIONS), help="目标处理状态")
+@click.option("--remark", default=None, help="处理备注")
+@click.option("--operator", default="财务", help="操作人")
+def check_mark(exception_id, arrear_id, all_type, status: str, remark: Optional[str], operator: str):
+    if exception_id is None and arrear_id is None and all_type is None:
+        console.print("[red]请指定 --exception-id、--arrear-id 或 --all-of-type 其中之一[/red]")
+        return
+    conn = get_connection()
+    try:
+        sql_parts: List[str] = []
+        params: List[Any] = []
+        if exception_id is not None:
+            sql_parts.append("id = ?")
+            params.append(exception_id)
+        if arrear_id is not None:
+            sql_parts.append("arrear_id = ?")
+            params.append(arrear_id)
+        if all_type is not None:
+            if all_type == "all":
+                pass
+            elif all_type in ANOMALY_TYPES:
+                sql_parts.append("exception_type = ?")
+                params.append(all_type)
+            else:
+                key_by_label = {v: k for k, v in ANOMALY_TYPES.items()}
+                if all_type in key_by_label:
+                    sql_parts.append("exception_type = ?")
+                    params.append(key_by_label[all_type])
+        where_sql = (" WHERE " + " AND ".join(sql_parts)) if sql_parts else ""
+        select_sql = f"SELECT id, exception_type, arrear_id, room_no, handle_status FROM audit_exceptions{where_sql}"
+        rows = conn.execute(select_sql, params).fetchall()
+        if not rows:
+            console.print("[yellow]未匹配到任何异常记录[/yellow]")
+            return
+        if not click.confirm(f"确认将 {len(rows)} 条异常标记为 [{status}] ？"):
+            return
+        now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        count_ok = 0
+        for r in rows:
+            update_parts = ["handle_status = ?", "handled_by = ?", "handled_at = ?"]
+            update_params: List[Any] = [status, operator, now_time]
+            if remark:
+                update_parts.insert(1, "handle_remark = COALESCE(NULLIF(handle_remark,'') || ' | ','') || ?")
+                update_params.insert(1, remark)
+            update_sql = f"UPDATE audit_exceptions SET {', '.join(update_parts)} WHERE id = ?"
+            update_params.append(r["id"])
+            conn.execute(update_sql, update_params)
+            count_ok += 1
+        conn.commit()
+        console.print(f"[green]✓ 已更新 {count_ok} 条记录的处理状态为 '{status}'[/green]")
+        table = Table(title=f"标记明细（前{min(10, count_ok)}条）")
+        table.add_column("异常ID", style="dim")
+        table.add_column("欠费ID", style="white")
+        table.add_column("房号", style="cyan")
+        table.add_column("异常类型", style="magenta")
+        table.add_column("原状态", style="yellow")
+        table.add_column("→ 新状态", style="green")
+        for r in rows[:10]:
+            table.add_row(str(r["id"]), str(r["arrear_id"]), r["room_no"],
+                          ANOMALY_TYPES.get(r["exception_type"], r["exception_type"]),
+                          r["handle_status"] or "待处理", status)
+        console.print(table)
+    except Exception as e:
+        conn.rollback()
+        console.print(f"[red]标记失败: {str(e)}[/red]")
+    finally:
+        conn.close()
+
+
+@check_cmd.command("list", help="查询已扫描的异常记录，支持按处理状态筛选")
+@click.option("--status", type=click.Choice(HANDLE_STATUS_OPTIONS + ["全部"]), default="全部", help="处理状态筛选")
+@click.option("--room", default=None, help="按房号模糊匹配")
+@click.option("--type", "atype", default=None, help="按异常类型筛选（名称或key）")
+@click.option("--output", "-o", default=None, help="导出到CSV")
+@click.option("--limit", type=int, default=100, help="显示条数")
+def check_list(status: str, room: Optional[str], atype: Optional[str], output: Optional[str], limit: int):
+    conn = get_connection()
+    try:
+        sql = "SELECT * FROM audit_exceptions WHERE 1=1"
+        params: List[Any] = []
+        if status != "全部":
+            sql += " AND handle_status = ?"
+            params.append(status)
+        if room:
+            sql += " AND room_no LIKE ?"
+            params.append(f"%{room}%")
+        if atype:
+            if atype in ANOMALY_TYPES:
+                sql += " AND exception_type = ?"
+                params.append(atype)
+            else:
+                key_by_label = {v: k for k, v in ANOMALY_TYPES.items()}
+                if atype in key_by_label:
+                    sql += " AND exception_type = ?"
+                    params.append(key_by_label[atype])
+        sql += " ORDER BY check_time DESC, id DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        if not rows:
+            console.print("[yellow]未找到异常记录[/yellow]")
+            return
+        t = _build_base_table(f"异常记录（共 {len(rows)} 条，显示最多{limit}条）", show_handle_cols=True)
+        csv_rows = []
+        for r in rows:
+            status_style = {"待处理": "yellow", "已确认": "blue", "已修复": "green", "暂缓处理": "dim"}.get(r["handle_status"] or "待处理", "white")
+            h_info = f"{r['handled_by'] or ''} {r['handled_at'] or ''}"[:20].strip()
+            t.add_row(
+                str(r["id"]), str(r["arrear_id"] or "-"), r["room_no"] or "-",
+                "", r["fee_period"] or "",
+                format_money(r["base_amount"] or 0), format_money(r["late_fee"] or 0),
+                format_money(r["paid_amount"] or 0), format_money(r["discount_amount"] or 0),
+                format_money(r["unpaid_amount"] or 0),
+                ANOMALY_TYPES.get(r["exception_type"], r["exception_type"]),
+                r["description"] or "",
+                f"[{status_style}]{r['handle_status'] or '待处理'}[/{status_style}]",
+                r["handle_remark"] or "-", h_info or "-",
+            )
+            csv_rows.append({
+                "异常ID": r["id"],
+                "异常类型": ANOMALY_TYPES.get(r["exception_type"], r["exception_type"]),
+                "欠费ID": r["arrear_id"],
+                "房号": r["room_no"],
+                "账期": r["fee_period"],
+                "说明": r["description"],
+                "尚欠": f"{r['unpaid_amount'] or 0:.2f}",
+                "扫描时间": r["check_time"],
+                "处理状态": r["handle_status"] or "待处理",
+                "处理备注": r["handle_remark"] or "",
+                "处理人": r["handled_by"] or "",
+                "处理时间": r["handled_at"] or "",
+            })
+        console.print(t)
+        if output:
+            with open(output, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(csv_rows)
+            console.print(f"[green]✓ 已导出 {len(csv_rows)} 条到 {output}[/green]")
+    finally:
+        conn.close()
