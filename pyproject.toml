@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "property-fee-cli"
+version = "1.0.0"
+description = "物业费催缴命令行工具 - 批量处理欠费提醒"
+requires-python = ">=3.8"
+dependencies = [
+    "click>=8.1.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+pfee = "property_fee_cli.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["property_fee_cli*"]
