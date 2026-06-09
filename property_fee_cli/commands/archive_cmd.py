@@ -20,7 +20,7 @@ def archive_cmd():
 def _find_latest_snapshot_for_arrear(conn, arrear_id: int) -> Optional[Dict[str, Any]]:
     """找到某欠费记录对应的最近归档快照"""
     row = conn.execute("""
-        SELECT si.snapshot_id, ss.period, ss.snapshot_no,
+        SELECT si.snapshot_id, ss.period, ss.snapshot_no, ss.locked, ss.locked_by, ss.locked_at,
                si.base_amount as snap_base, si.late_fee as snap_late,
                si.paid_amount as snap_paid, si.discount_amount as snap_disc,
                si.unpaid_amount as snap_unpaid
@@ -32,9 +32,18 @@ def _find_latest_snapshot_for_arrear(conn, arrear_id: int) -> Optional[Dict[str,
     return dict(row) if row else None
 
 
+def _is_arrear_snapshot_locked(conn, arrear_id: int) -> Optional[Dict[str, Any]]:
+    """欠费是否处于锁定归档中，返回锁定信息或None"""
+    snap = _find_latest_snapshot_for_arrear(conn, arrear_id)
+    if snap and snap.get("locked"):
+        return snap
+    return None
+
+
 def _write_adjustment_if_archived(conn, arrear_id: int, adjust_type: str,
                                   adjust_amount: float, remark: str,
-                                  operator: str) -> Optional[int]:
+                                  operator: str, is_override: bool = False,
+                                  override_reason: Optional[str] = None) -> Optional[int]:
     """若欠费已归档，写调整记录，返回adjustment_id；未归档返回None"""
     if not arrear_id:
         return None
@@ -50,22 +59,24 @@ def _write_adjustment_if_archived(conn, arrear_id: int, adjust_type: str,
     cur = conn.execute("""
         INSERT INTO adjustment_records
         (snapshot_id, arrear_id, household_id, adjust_type, adjust_amount,
-         original_unpaid, final_unpaid, operator, remark)
-        VALUES (?,?,?,?,?,?,?,?,?)
+         original_unpaid, final_unpaid, operator, remark, is_override, override_reason)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
     """, (
         snap["snapshot_id"], arrear_id, ar["household_id"], adjust_type,
         adjust_amount, snap["snap_unpaid"],
         float(ar["u"] or 0), operator, remark,
+        1 if is_override else 0, override_reason,
     ))
     return cur.lastrowid
 
 
-@archive_cmd.command("create", help="按月/楼栋生成账期结算快照（月结归档）")
+@archive_cmd.command("create", help="按月/楼栋生成账期结算快照（月结归档，默认仅归档指定账期）")
 @click.option("--period", "-p", required=True, help="账期，如 2026-05 或 2026-Q2")
 @click.option("--building", "-b", default=None, help="按楼栋筛选，默认全部楼栋")
+@click.option("--all-periods", is_flag=True, default=False, help="全量归档所有账期（默认仅归档--period对应账期）")
 @click.option("--description", default=None, help="归档备注")
 @click.option("--operator", default="财务月结", help="操作人")
-def archive_create(period: str, building: Optional[str], description: Optional[str], operator: str):
+def archive_create(period: str, building: Optional[str], all_periods: bool, description: Optional[str], operator: str):
     conn = get_connection()
     try:
         existing = conn.execute("""
@@ -76,9 +87,15 @@ def archive_create(period: str, building: Optional[str], description: Optional[s
 
         where_sql = ""
         params: List[Any] = []
+        conds = []
         if building:
-            where_sql = " WHERE h.building = ?"
+            conds.append("h.building = ?")
             params.append(building)
+        if not all_periods:
+            conds.append("a.fee_period LIKE ?")
+            params.append(f"%{period}%")
+        if conds:
+            where_sql = " WHERE " + " AND ".join(conds)
         items_sql = f"""
             SELECT a.id, a.household_id, a.fee_period, a.fee_type,
                    a.base_amount, a.late_fee, a.paid_amount, a.discount_amount,
@@ -90,7 +107,7 @@ def archive_create(period: str, building: Optional[str], description: Optional[s
         """
         rows = conn.execute(items_sql, params).fetchall()
         if not rows:
-            console.print("[yellow]没有符合条件的欠费记录[/yellow]")
+            console.print(f"[yellow]没有符合条件的欠费记录（账期={period}，楼栋={building or '全部'}，范围={'全量' if all_periods else '仅指定账期'}）[/yellow]")
             return
 
         snap_no = f"SNAP-{period}-{datetime.now().strftime('%m%d%H%M')}"
@@ -139,6 +156,7 @@ def archive_create(period: str, building: Optional[str], description: Optional[s
         console.print(Panel(
             f"[bold]归档编号:[/bold] {snap_no}\n"
             f"[bold]账期/楼栋:[/bold] {period}{(' / '+building) if building else ' / 全部楼栋'}\n"
+            f"[bold]归档范围:[/bold] {'全量所有账期' if all_periods else f'仅{period}账期'}\n"
             f"[bold]覆盖住户:[/bold] {len(hh_set)} 户    [bold]欠费记录:[/bold] {len(rows)} 条\n"
             f"本金合计: {format_money(tot_base)} 元    滞纳金合计: {format_money(tot_late)} 元\n"
             f"已缴合计: {format_money(tot_paid)} 元    减免合计: {format_money(tot_disc)} 元\n"
@@ -175,19 +193,71 @@ def archive_list(period: Optional[str], limit: int):
         t.add_column("归档编号", style="cyan")
         t.add_column("账期", style="white")
         t.add_column("楼栋", style="magenta")
+        t.add_column("状态", style="yellow")
         t.add_column("户数", justify="right")
         t.add_column("欠费数", justify="right")
         t.add_column("尚欠合计(元)", justify="right", style="bold red")
         t.add_column("操作人", style="white")
         t.add_column("归档时间", style="yellow")
         for r in rows:
+            if r["locked"]:
+                status = f"[bold red]🔒锁定[/bold red] ({r['locked_by'] or '-'} {(r['locked_at'] or '')[:16]})"
+            else:
+                status = "[green]开放[/green]"
             t.add_row(
                 str(r["id"]), r["snapshot_no"], r["period"],
-                r["building"] or "全部", str(r["total_households"]),
+                r["building"] or "全部", status,
+                str(r["total_households"]),
                 str(r["total_arrears"]), format_money(r["snap_unpaid_amount"] or 0),
                 r["created_by"] or "-", r["snapshot_time"] or "-",
             )
         console.print(t)
+    finally:
+        conn.close()
+
+
+@archive_cmd.command("lock", help="锁定归档快照（锁定后修改原始欠费需提供原因）")
+@click.argument("snapshot_id", type=int)
+@click.option("--operator", default="财务主管", help="锁定操作人")
+def archive_lock(snapshot_id: int, operator: str):
+    conn = get_connection()
+    try:
+        snap = conn.execute("SELECT id, snapshot_no, period, building, locked FROM settlement_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+        if not snap:
+            console.print(f"[red]快照ID {snapshot_id} 不存在[/red]")
+            return
+        if snap["locked"]:
+            console.print(f"[yellow]快照 {snap['snapshot_no']} 已处于锁定状态[/yellow]")
+            return
+        if not click.confirm(f"确认锁定快照 {snap['snapshot_no']}（{snap['period']}{' / '+snap['building'] if snap['building'] else ''}）？锁定后修改原始欠费需提供原因"):
+            return
+        conn.execute("UPDATE settlement_snapshots SET locked = 1, locked_by = ?, locked_at = datetime('now','localtime') WHERE id = ?", (operator, snapshot_id))
+        cnt = conn.execute("SELECT COUNT(*) FROM settlement_items WHERE snapshot_id = ?", (snapshot_id,)).fetchone()[0]
+        conn.commit()
+        console.print(f"[green]🔒 快照 {snap['snapshot_no']} 已锁定，涉及 {cnt} 条欠费。锁定后：普通缴费/减免仅写入调整记录，改原始欠费需提供 override 原因[/green]")
+    finally:
+        conn.close()
+
+
+@archive_cmd.command("unlock", help="反锁定归档快照（允许修改原始欠费）")
+@click.argument("snapshot_id", type=int)
+@click.option("--operator", default="财务主管", help="反锁定操作人")
+@click.option("--reason", required=True, help="反锁定原因")
+def archive_unlock(snapshot_id: int, operator: str, reason: str):
+    conn = get_connection()
+    try:
+        snap = conn.execute("SELECT id, snapshot_no, period, building, locked, locked_by FROM settlement_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+        if not snap:
+            console.print(f"[red]快照ID {snapshot_id} 不存在[/red]")
+            return
+        if not snap["locked"]:
+            console.print(f"[yellow]快照 {snap['snapshot_no']} 尚未锁定，无需解锁[/yellow]")
+            return
+        if not click.confirm(f"确认反锁定快照 {snap['snapshot_no']}？原因：{reason}"):
+            return
+        conn.execute("UPDATE settlement_snapshots SET locked = 0, locked_by = NULL, locked_at = NULL WHERE id = ?", (snapshot_id,))
+        conn.commit()
+        console.print(f"[yellow]🔓 快照 {snap['snapshot_no']} 已反锁定。操作人: {operator}，原因: {reason}[/yellow]")
     finally:
         conn.close()
 
@@ -307,16 +377,22 @@ def archive_adjustments(snapshot_id: Optional[int], room: Optional[str], atype: 
         t.add_column("调整额(元)", justify="right", style="yellow")
         t.add_column("原尚欠", justify="right")
         t.add_column("新尚欠", justify="right", style="bold red")
+        t.add_column("操作", style="bold yellow")
         t.add_column("操作人", style="white")
         t.add_column("时间", style="yellow")
         t.add_column("备注", style="dim", max_width=20)
         for r in rows:
+            if r["is_override"]:
+                op_tag = f"[bold red]改原始[/bold red]\n{(r['override_reason'] or '')[:12]}"
+            else:
+                op_tag = "[green]调整[/green]"
             t.add_row(
                 str(r["id"]), r["snapshot_no"] or "-", r["period"] or "-",
                 r["room_no"] or "-", r["adjust_type"],
                 format_money(r["adjust_amount"] or 0),
                 format_money(r["original_unpaid"] or 0),
                 format_money(r["final_unpaid"] or 0),
+                op_tag,
                 r["operator"] or "-", (r["created_at"] or "")[:16],
                 (r["remark"] or "")[:20],
             )

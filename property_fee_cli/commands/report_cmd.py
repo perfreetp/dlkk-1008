@@ -623,6 +623,36 @@ def household_file(room, output, hide_sensitive, encoding):
         WHERE pr.household_id = ? ORDER BY pr.created_at
     """, (household_id,)).fetchall()
 
+    import json
+    pending_info_by_id = {}
+    for p in payment_list:
+        if p.get("pending_id"):
+            if p["pending_id"] not in pending_info_by_id:
+                pp = conn.execute("""
+                    SELECT pp.*, h.room_no FROM pending_payments pp
+                    LEFT JOIN households h ON pp.matched_household_id = h.id
+                    WHERE pp.id = ?
+                """, (p["pending_id"],)).fetchone()
+                info = {"pp": dict(pp) if pp else None, "splits": [], "matched_fee_period": "", "peer_count": 0}
+                if pp:
+                    if pp.get("split_to_ids"):
+                        try:
+                            splits = json.loads(pp["split_to_ids"])
+                            for s in splits:
+                                ar = conn.execute("SELECT fee_period FROM arrears WHERE id = ?", (s["arrear_id"],)).fetchone()
+                                if ar:
+                                    info["splits"].append({"fee_period": ar["fee_period"], "amount": s["amount"]})
+                        except Exception:
+                            pass
+                    elif pp.get("matched_arrear_id"):
+                        ar = conn.execute("SELECT fee_period FROM arrears WHERE id = ?", (pp["matched_arrear_id"],)).fetchone()
+                        if ar:
+                            info["matched_fee_period"] = ar["fee_period"]
+                        peers = conn.execute("SELECT COUNT(*) FROM pending_payments WHERE matched_arrear_id = ? AND id != ? AND matched_arrear_id IS NOT NULL",
+                                             (pp["matched_arrear_id"] or -1, pp["id"])).fetchone()[0]
+                        info["peer_count"] = peers
+                pending_info_by_id[p["pending_id"]] = info
+
     conn.close()
 
     total_base = sum(r["base_amount"] for r in arrears_list)
@@ -758,6 +788,7 @@ def household_file(room, output, hide_sensitive, encoding):
             "mock": "-",
         })
 
+    import json
     for p in payment_list:
         detail_parts = [f"金额:{format_money(p['amount'])}元"]
         if p["pay_method"]:
@@ -766,6 +797,20 @@ def household_file(room, output, hide_sensitive, encoding):
             detail_parts.append(f"日期:{p['pay_date']}")
         if p["operator"]:
             detail_parts.append(f"经办人:{p['operator']}")
+        related_periods = []
+        if p.get("pending_id") and p["pending_id"] in pending_info_by_id:
+            info = pending_info_by_id[p["pending_id"]]
+            pp = info["pp"]
+            if pp:
+                detail_parts.append(f"流水#{pp['id']}")
+                if pp.get("payer_name"):
+                    detail_parts.append(f"付款人:{pp['payer_name']}")
+            if info["splits"]:
+                related_periods = [f"{s['fee_period']}({format_money(s['amount'])})" for s in info["splits"]]
+            elif info["matched_fee_period"] and pp:
+                related_periods = [f"{info['matched_fee_period']}({format_money(float(pp.get('amount') or 0))})"]
+            if info["peer_count"] > 0:
+                detail_parts.append(f"[与{info['peer_count']}笔流水合缴]")
         detail = " ".join(detail_parts)
         events.append({
             "time": p["created_at"],
@@ -773,7 +818,8 @@ def household_file(room, output, hide_sensitive, encoding):
             "type_style": "green",
             "detail": detail,
             "amount_change": f"-{format_money(p['amount'])}",
-            "export_detail": f"缴费金额:{p['amount']} 方式:{p['pay_method'] or ''} 缴费日期:{p['pay_date'] or ''} 经办人:{p['operator'] or ''} 备注:{p['remark'] or ''}",
+            "related_periods": " / ".join(related_periods),
+            "export_detail": f"缴费金额:{p['amount']} 方式:{p['pay_method'] or ''} 缴费日期:{p['pay_date'] or ''} 经办人:{p['operator'] or ''} 备注:{p['remark'] or ''} 关联账期:{';'.join(related_periods)}",
             "export_amount": -float(p["amount"] or 0),
             "fee_period": p["fee_period"] or "",
             "mock": "-",
@@ -786,12 +832,14 @@ def household_file(room, output, hide_sensitive, encoding):
     timeline.add_column("时间", style="white", no_wrap=True)
     timeline.add_column("类型", style="white")
     timeline.add_column("详情", style="white")
+    timeline.add_column("关联账期/拆分", style="cyan", max_width=30)
     timeline.add_column("金额变化", justify="right", style="white")
     for e in events:
         timeline.add_row(
             e["time"],
             f"[{e['type_style']}]{e['type']}[/{e['type_style']}]",
             e["detail"],
+            e.get("related_periods", "") or "-",
             e["amount_change"],
         )
     console.print(timeline)

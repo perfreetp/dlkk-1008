@@ -8,7 +8,7 @@ from .commands import import_cmd, list_cmd, calc_cmd, notice_cmd, send_cmd, reco
 
 
 @click.group(help="物业费催缴命令行工具 - 批量处理欠费提醒")
-@click.version_option("1.3.0", prog_name="pfee")
+@click.version_option("1.4.0", prog_name="pfee")
 def cli():
     init_db()
     pass

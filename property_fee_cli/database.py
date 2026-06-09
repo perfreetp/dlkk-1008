@@ -179,6 +179,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if not col_exists("payment_records", "pending_id"):
         cursor.execute("ALTER TABLE payment_records ADD COLUMN pending_id INTEGER")
 
+    if not col_exists("settlement_snapshots", "locked"):
+        cursor.execute("ALTER TABLE settlement_snapshots ADD COLUMN locked INTEGER DEFAULT 0")
+    if not col_exists("settlement_snapshots", "locked_by"):
+        cursor.execute("ALTER TABLE settlement_snapshots ADD COLUMN locked_by TEXT")
+    if not col_exists("settlement_snapshots", "locked_at"):
+        cursor.execute("ALTER TABLE settlement_snapshots ADD COLUMN locked_at TEXT")
+    if not col_exists("adjustment_records", "is_override"):
+        cursor.execute("ALTER TABLE adjustment_records ADD COLUMN is_override INTEGER DEFAULT 0")
+    if not col_exists("adjustment_records", "override_reason"):
+        cursor.execute("ALTER TABLE adjustment_records ADD COLUMN override_reason TEXT")
+
     if not table_exists("settlement_snapshots"):
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS settlement_snapshots (
@@ -195,7 +206,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 snap_late_fee REAL DEFAULT 0,
                 snap_paid_amount REAL DEFAULT 0,
                 snap_discount_amount REAL DEFAULT 0,
-                snap_unpaid_amount REAL DEFAULT 0
+                snap_unpaid_amount REAL DEFAULT 0,
+                locked INTEGER DEFAULT 0,
+                locked_by TEXT,
+                locked_at TEXT
             )
         """)
 
@@ -233,6 +247,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 operator TEXT,
                 remark TEXT,
                 created_at TEXT DEFAULT (datetime('now','localtime')),
+                is_override INTEGER DEFAULT 0,
+                override_reason TEXT,
                 FOREIGN KEY (snapshot_id) REFERENCES settlement_snapshots(id) ON DELETE SET NULL,
                 FOREIGN KEY (arrear_id) REFERENCES arrears(id) ON DELETE CASCADE
             )

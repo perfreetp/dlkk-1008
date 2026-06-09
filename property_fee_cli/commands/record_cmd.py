@@ -308,7 +308,7 @@ def mark_commitment(arrear_id, commit_date, amount, remark):
         conn.close()
 
 
-@record_cmd.command("discount", help="登记费用减免")
+@record_cmd.command("discount", help="登记费用减免（归档锁定后需提供override原因改原始欠费）")
 @click.argument("arrear_id", type=int)
 @click.option("--amount", "-a", type=float, required=True, help="减免金额（正数）")
 @click.option("--reason", "-r", required=True, type=click.Choice([
@@ -317,11 +317,19 @@ def mark_commitment(arrear_id, commit_date, amount, remark):
 ]), help="减免原因")
 @click.option("--approved-by", help="审批人")
 @click.option("--remark", help="详细说明")
-def record_discount(arrear_id, amount, reason, approved_by, remark):
+@click.option("--override-reason", default=None, help="改原始欠费override原因（归档锁定后必须提供）")
+def record_discount(arrear_id, amount, reason, approved_by, remark, override_reason):
     if amount <= 0:
         console.print("[red]减免金额必须大于0[/red]")
         return
     conn = get_connection()
+    from .archive_cmd import _is_arrear_snapshot_locked, _write_adjustment_if_archived
+    locked_info = _is_arrear_snapshot_locked(conn, arrear_id)
+    if locked_info and not override_reason:
+        console.print(f"[yellow]⚠️ 该欠费已在归档 [{locked_info['snapshot_no']}] 中被锁定。\n默认将仅写入调整记录（不修改原始欠费数据）。\n若确实需要改原始欠费，请加 --override-reason \"原因\" 重跑。[/yellow]")
+        if not click.confirm("按默认（仅写调整记录，不改原始欠费）继续？"):
+            conn.close()
+            return
     ar = conn.execute(f"""
         SELECT a.*, h.room_no, h.owner_name, h.id as household_id,
                {UNPAID_SQL_EXPR} as unpaid_calc
@@ -360,28 +368,57 @@ def record_discount(arrear_id, amount, reason, approved_by, remark):
         return
     try:
         approved_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute("""
-            INSERT INTO discount_records
-            (arrear_id, household_id, discount_amount, discount_reason, approved_by, approved_at, remark)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (arrear_id, ar["household_id"], amount, reason, approved_by, approved_at, remark or None))
-        conn.execute("""
-            UPDATE arrears SET discount_amount = discount_amount + ?, updated_at = datetime('now','localtime')
-            WHERE id = ?
-        """, (amount, arrear_id))
-        _refresh_arrear_status(conn, arrear_id)
-        _sync_batch_after_change(conn, arrear_id, "discount", f"减免{amount}")
+        full_remark = f"{reason} {approved_by or ''} {remark or ''}".strip()
+        mode_override = bool(locked_info and override_reason)
+        mode_adjust_only = bool(locked_info and not override_reason)
+
+        if not mode_adjust_only:
+            conn.execute("""
+                INSERT INTO discount_records
+                (arrear_id, household_id, discount_amount, discount_reason, approved_by, approved_at, remark)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (arrear_id, ar["household_id"], amount, reason, approved_by, approved_at, remark or None))
+            conn.execute("""
+                UPDATE arrears SET discount_amount = discount_amount + ?, updated_at = datetime('now','localtime')
+                WHERE id = ?
+            """, (amount, arrear_id))
+            _refresh_arrear_status(conn, arrear_id)
+            _sync_batch_after_change(conn, arrear_id, "discount", f"减免{amount}")
+
         try:
-            from .archive_cmd import _write_adjustment_if_archived
-            _write_adjustment_if_archived(
-                conn, arrear_id, "费用减免", -amount,
-                f"{reason} {approved_by or ''} {remark or ''}".strip(),
-                approved_by or "财务减免"
-            )
+            if locked_info:
+                if not mode_override:
+                    final_unpaid = float(ar["unpaid_calc"] or 0)
+                    conn.execute("""
+                        INSERT INTO adjustment_records
+                        (snapshot_id, arrear_id, household_id, adjust_type, adjust_amount,
+                         original_unpaid, final_unpaid, operator, remark, is_override, override_reason)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        locked_info["snapshot_id"], arrear_id, ar["household_id"],
+                        "费用减免(调整)", -amount,
+                        float(ar["unpaid_calc"] or 0), final_unpaid,
+                        approved_by or "财务减免", full_remark, 0, None,
+                    ))
+                else:
+                    conn.execute("""
+                        SELECT a.*, h.building FROM arrears a
+                        JOIN households h ON a.household_id = h.id WHERE a.id = ?
+                    """, (arrear_id,))
+                    _write_adjustment_if_archived(
+                        conn, arrear_id, "费用减免", -amount, full_remark,
+                        approved_by or "财务减免", True, override_reason,
+                    )
+            else:
+                _write_adjustment_if_archived(
+                    conn, arrear_id, "费用减免", -amount, full_remark,
+                    approved_by or "财务减免"
+                )
         except Exception:
             pass
         conn.commit()
-        console.print(f"[green]已登记减免 {format_money(amount)} 元，尚余 {format_money(new_unpaid)} 元[/green]")
+        tag = "（仅调整记录，未改原始欠费）" if mode_adjust_only else ("（改原始欠费-OVERRIDE）" if mode_override else "")
+        console.print(f"[green]已登记减免 {format_money(amount)} 元{tag}，尚余 {format_money(new_unpaid)} 元[/green]")
     except Exception as e:
         conn.rollback()
         console.print(f"[red]登记失败: {str(e)}[/red]")
@@ -441,18 +478,26 @@ def list_discounts(room_no, building, reason, limit):
     console.print(table)
 
 
-@record_cmd.command("payment", help="登记实际缴费（写入支付明细表）")
+@record_cmd.command("payment", help="登记实际缴费（归档锁定后需提供override原因改原始欠费）")
 @click.argument("arrear_id", type=int)
 @click.option("--amount", "-a", type=float, required=True, help="实际缴纳金额")
 @click.option("--pay-date", help="缴费日期，默认今天")
 @click.option("--method", type=click.Choice(["现金", "银行转账", "微信", "支付宝", "POS机", "其他"]), default="其他")
 @click.option("--operator", help="经办人")
 @click.option("--remark", help="备注")
-def record_payment(arrear_id, amount, pay_date, method, operator, remark):
+@click.option("--override-reason", default=None, help="改原始欠费override原因（归档锁定后必须提供）")
+def record_payment(arrear_id, amount, pay_date, method, operator, remark, override_reason):
     if amount <= 0:
         console.print("[red]缴费金额必须大于0[/red]")
         return
     conn = get_connection()
+    from .archive_cmd import _is_arrear_snapshot_locked, _write_adjustment_if_archived
+    locked_info = _is_arrear_snapshot_locked(conn, arrear_id)
+    if locked_info and not override_reason:
+        console.print(f"[yellow]⚠️ 该欠费已在归档 [{locked_info['snapshot_no']}] 中被锁定。\n默认将仅写入调整记录（不修改原始欠费数据）。\n若确实需要改原始欠费，请加 --override-reason \"原因\" 重跑。[/yellow]")
+        if not click.confirm("按默认（仅写调整记录，不改原始欠费）继续？"):
+            conn.close()
+            return
     ar = conn.execute(f"""
         SELECT a.*, h.room_no, h.owner_name, h.id as household_id,
                {UNPAID_SQL_EXPR} as unpaid_calc
@@ -490,30 +535,58 @@ def record_payment(arrear_id, amount, pay_date, method, operator, remark):
         conn.close()
         return
     try:
-        conn.execute("""
-            INSERT INTO payment_records
-            (arrear_id, household_id, amount, pay_method, pay_date, operator, remark)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (arrear_id, ar["household_id"], amount, method, actual_pay_date, operator or None, remark or None))
-        conn.execute("""
-            UPDATE arrears SET paid_amount = paid_amount + ?,
-                remark = COALESCE(NULLIF(?, ''), remark),
-                updated_at = datetime('now','localtime')
-            WHERE id = ?
-        """, (amount, remark or None, arrear_id))
-        _, _, new_st = _refresh_arrear_status(conn, arrear_id)
-        _sync_batch_after_change(conn, arrear_id, "payment", f"缴费{amount}")
+        actual_pay_date = pay_date or date.today().strftime("%Y-%m-%d")
+        full_remark = f"{method} 日期:{actual_pay_date} {remark or ''}".strip()
+        mode_override = bool(locked_info and override_reason)
+        mode_adjust_only = bool(locked_info and not override_reason)
+
+        if not mode_adjust_only:
+            conn.execute("""
+                INSERT INTO payment_records
+                (arrear_id, household_id, amount, pay_method, pay_date, operator, remark)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (arrear_id, ar["household_id"], amount, method, actual_pay_date, operator or None, remark or None))
+            conn.execute("""
+                UPDATE arrears SET paid_amount = paid_amount + ?,
+                    remark = COALESCE(NULLIF(?, ''), remark),
+                    updated_at = datetime('now','localtime')
+                WHERE id = ?
+            """, (amount, remark or None, arrear_id))
+            _, _, new_st = _refresh_arrear_status(conn, arrear_id)
+            _sync_batch_after_change(conn, arrear_id, "payment", f"缴费{amount}")
+        else:
+            new_st = new_status
+
         try:
-            from .archive_cmd import _write_adjustment_if_archived
-            _write_adjustment_if_archived(
-                conn, arrear_id, "实际缴费", -amount,
-                f"{method} 日期:{actual_pay_date} {remark or ''}".strip(),
-                operator or "手工登记缴费"
-            )
+            if locked_info:
+                if not mode_override:
+                    final_unpaid = float(ar["unpaid_calc"] or 0)
+                    conn.execute("""
+                        INSERT INTO adjustment_records
+                        (snapshot_id, arrear_id, household_id, adjust_type, adjust_amount,
+                         original_unpaid, final_unpaid, operator, remark, is_override, override_reason)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        locked_info["snapshot_id"], arrear_id, ar["household_id"],
+                        "实际缴费(调整)", -amount,
+                        float(ar["unpaid_calc"] or 0), final_unpaid,
+                        operator or "手工登记缴费", full_remark, 0, None,
+                    ))
+                else:
+                    _write_adjustment_if_archived(
+                        conn, arrear_id, "实际缴费", -amount, full_remark,
+                        operator or "手工登记缴费", True, override_reason,
+                    )
+            else:
+                _write_adjustment_if_archived(
+                    conn, arrear_id, "实际缴费", -amount, full_remark,
+                    operator or "手工登记缴费"
+                )
         except Exception:
             pass
         conn.commit()
-        console.print(f"[green]已登记缴费 {format_money(amount)} 元，余额 {format_money(new_unpaid)} 元，状态 {new_st}[/green]")
+        tag = "（仅调整记录，未改原始欠费）" if mode_adjust_only else ("（改原始欠费-OVERRIDE）" if mode_override else "")
+        console.print(f"[green]已登记缴费 {format_money(amount)} 元{tag}，余额 {format_money(new_unpaid)} 元，状态 {new_st}[/green]")
     except Exception as e:
         conn.rollback()
         console.print(f"[red]登记失败: {str(e)}[/red]")

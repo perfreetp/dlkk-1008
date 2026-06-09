@@ -396,6 +396,16 @@ def _apply_payment(conn, pending_id: int, operator: str = "银行流水导入") 
             _refresh_arrear_status(conn, arrear["id"])
             _sync_batch_after_change(conn, arrear["id"], "payment")
 
+            try:
+                from .archive_cmd import _write_adjustment_if_archived
+                _write_adjustment_if_archived(
+                    conn, arrear["id"], "银行流水缴费", -actual_amount,
+                    f"流水#{pending_id}拆分分配 {pp['payer_name'] or ''} {pp['remark'] or ''}".strip(),
+                    operator or "银行流水自动入账",
+                )
+            except Exception:
+                pass
+
             remaining = calc_unpaid(arrear["base_amount"], arrear["late_fee"], new_paid, arrear["discount_amount"])
             processed.append(f"{arrear['room_no']} {arrear['fee_period']} 缴费{actual_amount:,.2f}元 尚余{remaining:,.2f}元")
 
@@ -448,6 +458,16 @@ def _apply_payment(conn, pending_id: int, operator: str = "银行流水导入") 
                      (new_paid, arrear["id"]))
         _refresh_arrear_status(conn, arrear["id"])
         _sync_batch_after_change(conn, arrear["id"], "payment")
+
+        try:
+            from .archive_cmd import _write_adjustment_if_archived
+            _write_adjustment_if_archived(
+                conn, arrear["id"], "银行流水缴费", -amount,
+                f"流水#{pending_id} {pp['payer_name'] or ''} {pp['remark'] or ''}".strip(),
+                operator or "银行流水自动入账",
+            )
+        except Exception:
+            pass
 
         conn.execute("""
             UPDATE pending_payments
@@ -794,6 +814,107 @@ def bank_merge(pending_ids_comma: str, arrear_id: int, operator: str):
         for pid in pending_ids:
             console.print(f"  [cyan]pfee bank confirm {pid}[/cyan]")
         console.print(f"或批量确认: [cyan]pfee bank confirm-all[/cyan]")
+    finally:
+        conn.close()
+
+
+@bank_cmd.command("trace", help="流水-账期追溯视图：按流水号或房号查分配/合并关系")
+@click.option("--pending-id", "-p", type=int, default=None, help="按银行流水ID查询")
+@click.option("--room", "-r", default=None, help="按房号查询")
+@click.option("--arrear-id", type=int, default=None, help="按欠费ID查询")
+def bank_trace(pending_id: Optional[int], room: Optional[str], arrear_id: Optional[int]):
+    if not any([pending_id, room, arrear_id]):
+        console.print("[red]请提供 --pending-id 或 --room 或 --arrear-id 之一[/red]")
+        return
+    conn = get_connection()
+    try:
+        if pending_id:
+            pending_rows = [conn.execute("""
+                SELECT pp.*, h.room_no, h.owner_name
+                FROM pending_payments pp
+                LEFT JOIN households h ON pp.matched_household_id = h.id
+                WHERE pp.id = ?
+            """, (pending_id,)).fetchone()]
+        elif arrear_id:
+            pending_rows = conn.execute("""
+                SELECT pp.*, h.room_no, h.owner_name
+                FROM pending_payments pp
+                LEFT JOIN households h ON pp.matched_household_id = h.id
+                WHERE pp.matched_arrear_id = ?
+                   OR (pp.split_to_ids IS NOT NULL AND pp.split_to_ids LIKE ?)
+                ORDER BY pp.id
+            """, (arrear_id, f'%"arrear_id": {arrear_id}%')).fetchall()
+        else:
+            hid = conn.execute("SELECT id FROM households WHERE room_no LIKE ? LIMIT 1", (f"%{room}%",)).fetchone()
+            if not hid:
+                console.print(f"[red]房号 {room} 未找到[/red]")
+                return
+            pending_rows = conn.execute("""
+                SELECT pp.*, h.room_no, h.owner_name
+                FROM pending_payments pp
+                LEFT JOIN households h ON pp.matched_household_id = h.id
+                WHERE pp.matched_household_id = ?
+                ORDER BY pp.id
+            """, (hid["id"],)).fetchall()
+
+        pending_rows = [r for r in pending_rows if r]
+        if not pending_rows:
+            console.print("[yellow]未找到相关银行流水[/yellow]")
+            return
+
+        console.print(Panel(f"查询条件: pending_id={pending_id or '-'} / room={room or '-'} / arrear_id={arrear_id or '-'}，命中流水 {len(pending_rows)} 笔",
+                            title="流水追溯查询", style="cyan"))
+
+        for pp in pending_rows:
+            allocations = []
+            split_json = pp["split_to_ids"]
+            if split_json:
+                try:
+                    allocations = json.loads(split_json)
+                except Exception:
+                    allocations = []
+            elif pp["matched_arrear_id"]:
+                allocations = [{"arrear_id": pp["matched_arrear_id"], "amount": pp["amount"]}]
+
+            t = Table(title=f"流水#{pp['id']}  |  {pp['room_no'] or '未匹配'} {pp['owner_name'] or ''}  |  金额 {pp['amount'] or 0:,.2f}  |  状态 {pp['match_status'] or '-'}")
+            t.add_column("欠费ID", style="cyan")
+            t.add_column("房号", style="white")
+            t.add_column("账期", style="white")
+            t.add_column("分配金额(元)", justify="right", style="bold yellow")
+            t.add_column("欠费尚欠(元)", justify="right", style="bold red")
+            t.add_column("确认时间", style="dim")
+            t.add_column("关联缴费记录ID", style="dim")
+
+            if not allocations:
+                t.add_row("-", pp["room_no"] or "-", "-", "-", "-", "-", "(未匹配任何欠费)")
+            else:
+                for alloc in allocations:
+                    ar = conn.execute(f"""
+                        SELECT a.id, a.fee_period, h.room_no, {UNPAID_SQL_EXPR} as unpaid_calc
+                        FROM arrears a JOIN households h ON a.household_id = h.id
+                        WHERE a.id = ?
+                    """, (alloc["arrear_id"],)).fetchone()
+                    pr_ids = conn.execute("""
+                        SELECT id, created_at FROM payment_records WHERE pending_id = ? AND arrear_id = ? ORDER BY id
+                    """, (pp["id"], alloc["arrear_id"])).fetchall()
+                    t.add_row(
+                        str(alloc["arrear_id"]),
+                        ar["room_no"] if ar else "-",
+                        ar["fee_period"] if ar else "-",
+                        f"{alloc['amount']:,.2f}",
+                        f"{float(ar['unpaid_calc'] or 0):,.2f}" if ar else "-",
+                        pr_ids[0]["created_at"][:16] if pr_ids else "-",
+                        ",".join(str(p["id"]) for p in pr_ids) if pr_ids else "-",
+                    )
+            console.print(t)
+
+            merged_peers = conn.execute("""
+                SELECT id, amount, match_status FROM pending_payments
+                WHERE matched_arrear_id = ? AND id != ? AND matched_arrear_id IS NOT NULL
+            """, (pp["matched_arrear_id"], pp["id"])).fetchall() if pp["matched_arrear_id"] else []
+            if merged_peers:
+                peers_str = ", ".join(f"#{p['id']}({float(p['amount'] or 0):,.2f})" for p in merged_peers)
+                console.print(f"[dim]💡 该流水与同欠费 {len(merged_peers)} 笔流水合并确认: {peers_str}[/dim]")
     finally:
         conn.close()
 
