@@ -4,6 +4,7 @@ import os
 from datetime import datetime, date
 from rich.console import Console
 from rich.table import Table
+from rich.panel import Panel
 from typing import Optional
 
 from ..database import get_connection
@@ -835,3 +836,130 @@ def household_file(room, output, hide_sensitive, encoding):
                     e.get("fee_period", ""), e["export_detail"], e["export_amount"]
                 ])
         console.print(f"\n[green]单户催缴档案已导出到 {output}[/green]")
+
+
+@report_cmd.command("monthly", help="月结账期报表：原始金额 + 调整金额 = 最终余额")
+@click.option("--period", "-p", required=True, help="账期，如 2026-05")
+@click.option("--building", "-b", default=None, help="按楼栋筛选")
+@click.option("--output", "-o", type=click.Path(writable=True), help="导出CSV")
+@click.option("--encoding", default="utf-8-sig")
+def report_monthly(period: str, building: Optional[str], output: Optional[str], encoding: str):
+    conn = get_connection()
+    try:
+        snap_rows = conn.execute("""
+            SELECT * FROM settlement_snapshots
+            WHERE period = ? AND COALESCE(building,'') LIKE COALESCE(?, '')
+            ORDER BY snapshot_time DESC
+        """, (period, building or "%")).fetchall()
+        if not snap_rows:
+            console.print(f"[yellow]账期 {period}{(' '+building) if building else ''} 尚无归档快照，请先 archive create[/yellow]")
+            return
+        snap = snap_rows[0]
+        snap_id = snap["id"]
+        items = conn.execute("""
+            SELECT si.*, a.base_amount as cur_base, a.late_fee as cur_late,
+                   a.paid_amount as cur_paid, a.discount_amount as cur_disc,
+                   a.status as cur_status,
+                   (COALESCE(a.base_amount,0)+COALESCE(a.late_fee,0)-COALESCE(a.paid_amount,0)-COALESCE(a.discount_amount,0)) as cur_unpaid,
+                   h.building
+            FROM settlement_items si
+            LEFT JOIN arrears a ON si.arrear_id = a.id
+            LEFT JOIN households h ON si.household_id = h.id
+            WHERE si.snapshot_id = ?
+            ORDER BY h.building, si.room_no, si.fee_period
+        """, (snap_id,)).fetchall()
+
+        ar_adj = conn.execute("""
+            SELECT ar.arrear_id,
+                   SUM(CASE WHEN ar.adjust_type='实际缴费' THEN ar.adjust_amount ELSE 0 END) as pay_adj,
+                   SUM(CASE WHEN ar.adjust_type='费用减免' THEN ar.adjust_amount ELSE 0 END) as disc_adj,
+                   SUM(CASE WHEN ar.adjust_type='滞纳金调整' THEN ar.adjust_amount ELSE 0 END) as late_adj,
+                   SUM(ar.adjust_amount) as total_adj,
+                   COUNT(*) as adj_count
+            FROM adjustment_records ar
+            WHERE ar.snapshot_id = ?
+            GROUP BY ar.arrear_id
+        """, (snap_id,)).fetchall()
+        adj_map = {r["arrear_id"]: dict(r) for r in ar_adj}
+
+        console.print(Panel(
+            f"[bold]归档编号:[/bold] {snap['snapshot_no']}    [bold]账期:[/bold] {period}    [bold]楼栋:[/bold] {building or '全部'}\n"
+            f"[bold]归档时间:[/bold] {snap['snapshot_time']}    [bold]操作人:[/bold] {snap['created_by']}\n"
+            f"[bold]归档住户:[/bold] {snap['total_households']} 户    [bold]欠费笔数:[/bold] {snap['total_arrears']} 笔\n"
+            f"[bold]尚欠合计(归档):[/bold] {format_money(snap['snap_unpaid_amount'])} 元    [bold]备注:[/bold] {snap['description'] or '-'}",
+            title=f"月结账期报表：{period}", style="cyan",
+        ))
+
+        t = Table(title=f"明细（共{len(items)}条，显示前30条）")
+        t.add_column("楼栋", style="magenta")
+        t.add_column("房号", style="cyan")
+        t.add_column("业主", style="white")
+        t.add_column("账期", style="white")
+        t.add_column("归档尚欠", justify="right", style="blue")
+        t.add_column("缴费调整", justify="right", style="green")
+        t.add_column("减免调整", justify="right", style="magenta")
+        t.add_column("滞纳金调整", justify="right", style="yellow")
+        t.add_column("最终余额", justify="right", style="bold red")
+        t.add_column("当前状态", style="white")
+
+        csv_rows = []
+        sum_snap = 0.0
+        sum_pay_adj = 0.0
+        sum_disc_adj = 0.0
+        sum_late_adj = 0.0
+        sum_final = 0.0
+        for it in items:
+            arid = it["arrear_id"]
+            adj = adj_map.get(arid, {"pay_adj": 0, "disc_adj": 0, "late_adj": 0, "total_adj": 0})
+            snap_u = float(it["unpaid_amount"] or 0)
+            cur_u = float(it["cur_unpaid"] or 0) if it["cur_unpaid"] is not None else snap_u
+            pay_a = float(adj["pay_adj"] or 0)
+            disc_a = float(adj["disc_adj"] or 0)
+            late_a = float(adj["late_adj"] or 0)
+            final = round(snap_u + pay_a + disc_a + late_a, 2)
+            sum_snap += snap_u
+            sum_pay_adj += pay_a
+            sum_disc_adj += disc_a
+            sum_late_adj += late_a
+            sum_final += final
+
+            t.add_row(
+                it["building"] or "-", it["room_no"], it["owner_name"] or "", it["fee_period"],
+                format_money(snap_u), format_money(-pay_a), format_money(-disc_a),
+                format_money(late_a), format_money(final),
+                (it["cur_status"] or it["status"] or "")[:8],
+            )
+            csv_rows.append({
+                "楼栋": it["building"] or "", "房号": it["room_no"], "业主": it["owner_name"] or "",
+                "账期": it["fee_period"],
+                "归档本金": f"{it['base_amount']:.2f}", "归档滞纳金": f"{it['late_fee']:.2f}",
+                "归档已缴": f"{it['paid_amount']:.2f}", "归档减免": f"{it['discount_amount']:.2f}",
+                "归档尚欠": f"{snap_u:.2f}",
+                "缴费调整": f"{-pay_a:.2f}", "减免调整": f"{-disc_a:.2f}", "滞纳金调整": f"{late_a:.2f}",
+                "最终余额": f"{final:.2f}", "当前余额": f"{cur_u:.2f}",
+                "归档状态": it["status"] or "", "当前状态": it["cur_status"] or "",
+            })
+        console.print(t)
+        if len(items) > 30:
+            console.print(f"[dim]剩余{len(items)-30}条，请加 --output 导出完整数据[/dim]")
+
+        footer = Table(show_header=False, box=None, padding=(0, 3))
+        footer.add_column(style="bold")
+        footer.add_column()
+        footer.add_row("归档尚欠合计", format_money(sum_snap) + " 元")
+        footer.add_row("缴费调整合计", f"[green]{format_money(-sum_pay_adj)}[/green] 元")
+        footer.add_row("减免调整合计", f"[magenta]{format_money(-sum_disc_adj)}[/magenta] 元")
+        footer.add_row("滞纳金调整合计", f"[yellow]{format_money(sum_late_adj)}[/yellow] 元")
+        footer.add_row("最终余额合计", f"[bold red]{format_money(sum_final)}[/bold red] 元")
+        console.print()
+        console.print(footer)
+
+        if output:
+            with open(output, "w", encoding=encoding, newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(csv_rows)
+            console.print(f"\n[green]月报已导出: {output} ({len(csv_rows)}条)[/green]")
+    finally:
+        conn.close()
+

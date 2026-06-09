@@ -4,11 +4,11 @@ from rich.console import Console
 console = Console()
 
 from .database import init_db
-from .commands import import_cmd, list_cmd, calc_cmd, notice_cmd, send_cmd, record_cmd, report_cmd, check_cmd, bank_cmd, batch_cmd
+from .commands import import_cmd, list_cmd, calc_cmd, notice_cmd, send_cmd, record_cmd, report_cmd, check_cmd, bank_cmd, batch_cmd, archive_cmd
 
 
 @click.group(help="物业费催缴命令行工具 - 批量处理欠费提醒")
-@click.version_option("1.2.0", prog_name="pfee")
+@click.version_option("1.3.0", prog_name="pfee")
 def cli():
     init_db()
     pass
@@ -24,6 +24,7 @@ cli.add_command(report_cmd.report_cmd)
 cli.add_command(check_cmd.check_cmd)
 cli.add_command(bank_cmd.bank_cmd)
 cli.add_command(batch_cmd.batch_cmd)
+cli.add_command(archive_cmd.archive_cmd)
 
 
 if __name__ == "__main__":

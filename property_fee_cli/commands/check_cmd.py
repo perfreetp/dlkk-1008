@@ -50,6 +50,8 @@ def _build_base_table(title: str, show_handle_cols: bool = False) -> Table:
         t.add_column("处理状态", style="yellow")
         t.add_column("处理备注", style="dim", max_width=20)
         t.add_column("处理人/时间", style="dim", max_width=20)
+        t.add_column("复核人", style="dim", max_width=12)
+        t.add_column("复核时间", style="dim", max_width=16)
     return t
 
 
@@ -138,7 +140,7 @@ def audit(output_file: Optional[str], auto_fix: bool, reset_handle: bool, show_h
 
     for ae in anomalies_all:
         existing = conn.execute("""
-            SELECT id, handle_status, handle_remark, handled_by, handled_at
+            SELECT id, handle_status, handle_remark, handled_by, handled_at, reviewer, reviewed_at
             FROM audit_exceptions
             WHERE arrear_id = ? AND exception_type = ? AND handle_status != '已修复'
             ORDER BY id DESC LIMIT 1
@@ -154,6 +156,8 @@ def audit(output_file: Optional[str], auto_fix: bool, reset_handle: bool, show_h
             ae["handle_remark"] = existing["handle_remark"] or ""
             ae["handled_by"] = existing["handled_by"] or ""
             ae["handled_at"] = existing["handled_at"] or ""
+            ae["reviewer"] = existing["reviewer"] or ""
+            ae["reviewed_at"] = existing["reviewed_at"] or ""
             conn.execute("""
                 UPDATE audit_exceptions SET
                     check_time = ?, description = ?,
@@ -181,6 +185,8 @@ def audit(output_file: Optional[str], auto_fix: bool, reset_handle: bool, show_h
             ae["handle_remark"] = ""
             ae["handled_by"] = ""
             ae["handled_at"] = ""
+            ae["reviewer"] = ""
+            ae["reviewed_at"] = ""
 
     conn.commit()
     conn.close()
@@ -227,6 +233,8 @@ def audit(output_file: Optional[str], auto_fix: bool, reset_handle: bool, show_h
                 f"[{status_style}]{r['handle_status']}[/{status_style}]",
                 r.get("handle_remark") or "-",
                 h_info or "-",
+                r.get("reviewer") or "-",
+                (r.get("reviewed_at") or "")[:16] or "-",
             )
         console.print(t)
 
@@ -251,6 +259,8 @@ def audit(output_file: Optional[str], auto_fix: bool, reset_handle: bool, show_h
                 "处理备注": r.get("handle_remark") or "",
                 "处理人": r.get("handled_by") or "",
                 "处理时间": r.get("handled_at") or "",
+                "复核人": r.get("reviewer") or "",
+                "复核时间": r.get("reviewed_at") or "",
             })
 
     console.print()
@@ -288,7 +298,8 @@ def audit(output_file: Optional[str], auto_fix: bool, reset_handle: bool, show_h
                 writer = csv.DictWriter(f, fieldnames=[
                     "异常ID", "异常类型", "欠费ID", "房号", "业主", "账期",
                     "本金", "滞纳金", "已缴", "减免", "尚欠", "差额", "原状态",
-                    "说明", "扫描时间", "处理状态", "处理备注", "处理人", "处理时间"
+                    "说明", "扫描时间", "处理状态", "处理备注", "处理人", "处理时间",
+                    "复核人", "复核时间"
                 ])
                 writer.writeheader()
                 writer.writerows(csv_rows)
@@ -371,7 +382,9 @@ def audit(output_file: Optional[str], auto_fix: bool, reset_handle: bool, show_h
 @click.option("--status", required=True, type=click.Choice(HANDLE_STATUS_OPTIONS), help="目标处理状态")
 @click.option("--remark", default=None, help="处理备注")
 @click.option("--operator", default="财务", help="操作人")
-def check_mark(exception_id, arrear_id, all_type, status: str, remark: Optional[str], operator: str):
+@click.option("--review/--no-review", "review", default=False, help="是否同时标记为已复核")
+@click.option("--reviewer", default="财务主管", help="复核人姓名，默认'财务主管'")
+def check_mark(exception_id, arrear_id, all_type, status: str, remark: Optional[str], operator: str, review: bool, reviewer: str):
     if exception_id is None and arrear_id is None and all_type is None:
         console.print("[red]请指定 --exception-id、--arrear-id 或 --all-of-type 其中之一[/red]")
         return
@@ -402,7 +415,10 @@ def check_mark(exception_id, arrear_id, all_type, status: str, remark: Optional[
         if not rows:
             console.print("[yellow]未匹配到任何异常记录[/yellow]")
             return
-        if not click.confirm(f"确认将 {len(rows)} 条异常标记为 [{status}] ？"):
+        confirm_msg = f"确认将 {len(rows)} 条异常标记为 [{status}] ？"
+        if review:
+            confirm_msg += f"\n同时标记为已复核，复核人：{reviewer}"
+        if not click.confirm(confirm_msg):
             return
         now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         count_ok = 0
@@ -412,12 +428,20 @@ def check_mark(exception_id, arrear_id, all_type, status: str, remark: Optional[
             if remark:
                 update_parts.insert(1, "handle_remark = COALESCE(NULLIF(handle_remark,'') || ' | ','') || ?")
                 update_params.insert(1, remark)
+            if review:
+                update_parts.append("reviewer = ?")
+                update_params.append(reviewer)
+                update_parts.append("reviewed_at = ?")
+                update_params.append(now_time)
             update_sql = f"UPDATE audit_exceptions SET {', '.join(update_parts)} WHERE id = ?"
             update_params.append(r["id"])
             conn.execute(update_sql, update_params)
             count_ok += 1
         conn.commit()
-        console.print(f"[green]✓ 已更新 {count_ok} 条记录的处理状态为 '{status}'[/green]")
+        msg = f"[green]✓ 已更新 {count_ok} 条记录的处理状态为 '{status}'[/green]"
+        if review:
+            msg += f" [blue]（同时已复核，复核人：{reviewer}）[/blue]"
+        console.print(msg)
         table = Table(title=f"标记明细（前{min(10, count_ok)}条）")
         table.add_column("异常ID", style="dim")
         table.add_column("欠费ID", style="white")
@@ -425,10 +449,16 @@ def check_mark(exception_id, arrear_id, all_type, status: str, remark: Optional[
         table.add_column("异常类型", style="magenta")
         table.add_column("原状态", style="yellow")
         table.add_column("→ 新状态", style="green")
+        if review:
+            table.add_column("复核人", style="blue")
+            table.add_column("复核时间", style="dim")
         for r in rows[:10]:
-            table.add_row(str(r["id"]), str(r["arrear_id"]), r["room_no"],
-                          ANOMALY_TYPES.get(r["exception_type"], r["exception_type"]),
-                          r["handle_status"] or "待处理", status)
+            row_data = [str(r["id"]), str(r["arrear_id"]), r["room_no"],
+                        ANOMALY_TYPES.get(r["exception_type"], r["exception_type"]),
+                        r["handle_status"] or "待处理", status]
+            if review:
+                row_data.extend([reviewer, now_time])
+            table.add_row(*row_data)
         console.print(table)
     except Exception as e:
         conn.rollback()
@@ -484,6 +514,8 @@ def check_list(status: str, room: Optional[str], atype: Optional[str], output: O
                 r["description"] or "",
                 f"[{status_style}]{r['handle_status'] or '待处理'}[/{status_style}]",
                 r["handle_remark"] or "-", h_info or "-",
+                r["reviewer"] or "-",
+                (r["reviewed_at"] or "")[:16] or "-",
             )
             csv_rows.append({
                 "异常ID": r["id"],
@@ -498,6 +530,8 @@ def check_list(status: str, room: Optional[str], atype: Optional[str], output: O
                 "处理备注": r["handle_remark"] or "",
                 "处理人": r["handled_by"] or "",
                 "处理时间": r["handled_at"] or "",
+                "复核人": r["reviewer"] or "",
+                "复核时间": r["reviewed_at"] or "",
             })
         console.print(t)
         if output:
@@ -506,5 +540,146 @@ def check_list(status: str, room: Optional[str], atype: Optional[str], output: O
                 writer.writeheader()
                 writer.writerows(csv_rows)
             console.print(f"[green]✓ 已导出 {len(csv_rows)} 条到 {output}[/green]")
+    finally:
+        conn.close()
+
+
+@check_cmd.command("export-summary", help="按楼栋+处理状态导出异常汇总台账")
+@click.option("--output", "-o", "output_file", required=True, help="导出CSV路径（必填）")
+@click.option("--period", "-p", default=None, help="按异常记录check_time的年月筛选，格式如2026-05")
+@click.option("--operator", default="系统", help="导出操作人/备注，默认'系统'")
+def export_summary(output_file: str, period: Optional[str], operator: str):
+    import os
+
+    conn = get_connection()
+    try:
+        where_parts = []
+        params: List[Any] = []
+        if period:
+            where_parts.append("strftime('%Y-%m', ae.check_time) = ?")
+            params.append(period)
+
+        where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+        detail_sql = f"""
+            SELECT ae.id AS exception_id,
+                   COALESCE(h.building, '未知') AS building,
+                   ae.room_no,
+                   COALESCE(h.owner_name, '') AS owner_name,
+                   ae.fee_period,
+                   ae.exception_type,
+                   COALESCE(ae.handle_status, '待处理') AS handle_status,
+                   COALESCE(ae.handled_by, '') AS handled_by,
+                   COALESCE(ae.handled_at, '') AS handled_at,
+                   COALESCE(ae.handle_remark, '') AS handle_remark,
+                   COALESCE(ae.reviewer, '') AS reviewer,
+                   COALESCE(ae.reviewed_at, '') AS reviewed_at,
+                   ae.check_time
+            FROM audit_exceptions ae
+            LEFT JOIN arrears ar ON ae.arrear_id = ar.id
+            LEFT JOIN households h ON (h.room_no = ae.room_no OR h.id = ar.household_id)
+            {where_sql}
+            ORDER BY COALESCE(h.building, '未知'), ae.room_no, ae.fee_period, ae.id
+        """
+        detail_rows = conn.execute(detail_sql, params).fetchall()
+
+        if not detail_rows:
+            console.print("[yellow]未找到任何异常记录[/yellow]")
+            return
+
+        building_stats: Dict[str, Dict[str, Any]] = {}
+        last_scan_per_building: Dict[str, str] = {}
+
+        for r in detail_rows:
+            b = r["building"] or "未知"
+            if b not in building_stats:
+                building_stats[b] = {
+                    "total": 0,
+                    "待处理": 0,
+                    "已确认": 0,
+                    "已修复": 0,
+                    "暂缓处理": 0,
+                    "reviewed": 0,
+                    "not_reviewed": 0,
+                }
+            building_stats[b]["total"] += 1
+            status = r["handle_status"] or "待处理"
+            if status in building_stats[b]:
+                building_stats[b][status] += 1
+            if r["reviewer"] and r["reviewed_at"]:
+                building_stats[b]["reviewed"] += 1
+            else:
+                building_stats[b]["not_reviewed"] += 1
+            ct = r["check_time"] or ""
+            if ct:
+                if b not in last_scan_per_building or ct > last_scan_per_building[b]:
+                    last_scan_per_building[b] = ct
+
+        summary_rows = []
+        sorted_buildings = sorted(building_stats.keys())
+        for b in sorted_buildings:
+            s = building_stats[b]
+            total = s["total"]
+            pending = s["待处理"]
+            pending_ratio = f"{(pending / total * 100):.2f}%" if total > 0 else "0.00%"
+            reviewed = s["reviewed"]
+            not_reviewed = s["not_reviewed"]
+            review_rate = f"{(reviewed / total * 100):.2f}%" if total > 0 else "0.00%"
+            summary_rows.append({
+                "楼栋": b,
+                "异常总数": total,
+                "待处理": pending,
+                "已确认": s["已确认"],
+                "已修复": s["已修复"],
+                "暂缓处理": s["暂缓处理"],
+                "待处理占比": pending_ratio,
+                "已复核数": reviewed,
+                "未复核数": not_reviewed,
+                "复核率": review_rate,
+                "最后扫描时间": last_scan_per_building.get(b, ""),
+            })
+
+        with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "楼栋", "异常总数", "待处理", "已确认", "已修复", "暂缓处理",
+                "待处理占比", "已复核数", "未复核数", "复核率", "最后扫描时间"
+            ])
+            writer.writeheader()
+            writer.writerows(summary_rows)
+        console.print(f"[green]✓ 汇总台账已导出: {output_file}（共 {len(summary_rows)} 栋楼）[/green]")
+
+        base, ext = os.path.splitext(output_file)
+        detail_file = f"{base}_detail{ext}"
+
+        with open(detail_file, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "异常ID", "楼栋", "房号", "业主", "账期", "异常类型",
+                "处理状态", "处理人", "处理时间", "处理备注", "复核人", "复核时间"
+            ])
+            writer.writeheader()
+            for r in detail_rows:
+                writer.writerow({
+                    "异常ID": r["exception_id"],
+                    "楼栋": r["building"],
+                    "房号": r["room_no"] or "",
+                    "业主": r["owner_name"] or "",
+                    "账期": r["fee_period"] or "",
+                    "异常类型": ANOMALY_TYPES.get(r["exception_type"], r["exception_type"]),
+                    "处理状态": r["handle_status"] or "待处理",
+                    "处理人": r["handled_by"] or "",
+                    "处理时间": r["handled_at"] or "",
+                    "处理备注": r["handle_remark"] or "",
+                    "复核人": r["reviewer"] or "",
+                    "复核时间": r["reviewed_at"] or "",
+                })
+        console.print(f"[green]✓ 明细数据已导出: {detail_file}（共 {len(detail_rows)} 条）[/green]")
+
+        grand_total = sum(s["异常总数"] for s in summary_rows)
+        grand_reviewed = sum(s["已复核数"] for s in summary_rows)
+        grand_review_rate = f"{(grand_reviewed / grand_total * 100):.2f}%" if grand_total > 0 else "0.00%"
+        console.print(f"[dim]导出操作人: {operator} | 异常总计: {grand_total} | 总复核率: {grand_review_rate}[/dim]")
+
+    except Exception as e:
+        console.print(f"[red]导出失败: {str(e)}[/red]")
     finally:
         conn.close()

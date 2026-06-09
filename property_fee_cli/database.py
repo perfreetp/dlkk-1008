@@ -167,6 +167,86 @@ def _migrate(conn: sqlite3.Connection) -> None:
             )
         """)
 
+    if not col_exists("audit_exceptions", "reviewer"):
+        cursor.execute("ALTER TABLE audit_exceptions ADD COLUMN reviewer TEXT")
+
+    if not col_exists("audit_exceptions", "reviewed_at"):
+        cursor.execute("ALTER TABLE audit_exceptions ADD COLUMN reviewed_at TEXT")
+
+    if not col_exists("pending_payments", "split_to_ids"):
+        cursor.execute("ALTER TABLE pending_payments ADD COLUMN split_to_ids TEXT")
+
+    if not col_exists("payment_records", "pending_id"):
+        cursor.execute("ALTER TABLE payment_records ADD COLUMN pending_id INTEGER")
+
+    if not table_exists("settlement_snapshots"):
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_no TEXT NOT NULL UNIQUE,
+                period TEXT NOT NULL,
+                building TEXT,
+                snapshot_time TEXT DEFAULT (datetime('now','localtime')),
+                description TEXT,
+                created_by TEXT,
+                total_households INTEGER DEFAULT 0,
+                total_arrears INTEGER DEFAULT 0,
+                snap_base_amount REAL DEFAULT 0,
+                snap_late_fee REAL DEFAULT 0,
+                snap_paid_amount REAL DEFAULT 0,
+                snap_discount_amount REAL DEFAULT 0,
+                snap_unpaid_amount REAL DEFAULT 0
+            )
+        """)
+
+    if not table_exists("settlement_items"):
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL,
+                arrear_id INTEGER,
+                household_id INTEGER,
+                room_no TEXT,
+                owner_name TEXT,
+                fee_period TEXT,
+                base_amount REAL DEFAULT 0,
+                late_fee REAL DEFAULT 0,
+                paid_amount REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                unpaid_amount REAL DEFAULT 0,
+                status TEXT,
+                FOREIGN KEY (snapshot_id) REFERENCES settlement_snapshots(id) ON DELETE CASCADE
+            )
+        """)
+
+    if not table_exists("adjustment_records"):
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS adjustment_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER,
+                arrear_id INTEGER NOT NULL,
+                household_id INTEGER,
+                adjust_type TEXT NOT NULL,
+                adjust_amount REAL NOT NULL DEFAULT 0,
+                original_unpaid REAL DEFAULT 0,
+                final_unpaid REAL DEFAULT 0,
+                operator TEXT,
+                remark TEXT,
+                created_at TEXT DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (snapshot_id) REFERENCES settlement_snapshots(id) ON DELETE SET NULL,
+                FOREIGN KEY (arrear_id) REFERENCES arrears(id) ON DELETE CASCADE
+            )
+        """)
+
+    try:
+        cursor.execute("SELECT id, name, content FROM notice_templates WHERE is_default = 1 AND name = '通用催缴短信'")
+        tpl = cursor.fetchone()
+        if tpl and '{total_amount}' in (tpl['content'] or '') and '{unpaid_amount}' not in (tpl['content'] or ''):
+            new_content = tpl['content'].replace('共计{total_amount}', '共计{unpaid_amount}')
+            cursor.execute("UPDATE notice_templates SET content = ? WHERE id = ?", (new_content, tpl['id']))
+    except Exception:
+        pass
+
     sms_configs = [
         ("sms_provider", ""),
         ("sms_signature", ""),
@@ -313,7 +393,7 @@ def init_db() -> None:
         cursor.executemany("""
         INSERT INTO notice_templates (name, content, is_default) VALUES (?, ?, ?)
         """, [
-            ("通用催缴短信", "【{signature}】尊敬的{owner_name}业主，您{room_no}室的{fee_period}{fee_type}共计{total_amount}元已于{due_date}到期，请您尽快缴纳。如有疑问请致电{service_phone}。退订回T", 1),
+            ("通用催缴短信", "【{signature}】尊敬的{owner_name}业主，您{room_no}室的{fee_period}{fee_type}共计{unpaid_amount}元已于{due_date}到期，请您尽快缴纳。如有疑问请致电{service_phone}。退订回T", 1),
             ("温馨提醒短信", "【{signature}】温馨提醒：尊敬的{owner_name}业主，您{room_no}室尚有{fee_period}的物业费用未缴，合计{unpaid_amount}元。请您在方便时前往物业中心或线上缴纳，感谢您的配合！退订回T", 0),
             ("滞纳金提醒", "【{signature}】尊敬的{owner_name}业主，您{room_no}室的{fee_period}{fee_type}已逾期，本金{base_amount}元，产生滞纳金{late_fee}元，合计{unpaid_amount}元。请尽快缴纳以免产生更多滞纳金。退订回T", 0),
         ])

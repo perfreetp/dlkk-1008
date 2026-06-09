@@ -334,25 +334,8 @@ def _apply_payment(conn, pending_id: int, operator: str = "银行流水导入") 
     if pp["match_status"] == "已确认":
         console.print(f"[yellow]记录 {pending_id} 已确认过，跳过[/yellow]")
         return False
-    if not pp["matched_arrear_id"]:
-        console.print(f"[red]记录 {pending_id} 没有匹配到欠费，请先使用 bank match 重新匹配[/red]")
-        return False
 
-    arrear = conn.execute(f"""
-        SELECT a.*, h.room_no, {UNPAID_SQL_EXPR} as unpaid_calc
-        FROM arrears a JOIN households h ON a.household_id = h.id
-        WHERE a.id = ?
-    """, (pp["matched_arrear_id"],)).fetchone()
-    if not arrear:
-        console.print(f"[red]欠费ID {pp['matched_arrear_id']} 不存在[/red]")
-        return False
-
-    amount = pp["amount"] or 0
-    if amount > arrear["unpaid_calc"] + 0.01:
-        console.print(f"[yellow]⚠ 流水金额 {amount:,.2f} 大于尚欠 {arrear['unpaid_calc']:,.2f}，按实缴 {arrear['unpaid_calc']:,.2f} 写入，剩余 {amount-arrear['unpaid_calc']:,.2f} 需财务单独处理[/yellow]")
-        amount = arrear["unpaid_calc"]
-
-    from .record_cmd import _refresh_arrear_status
+    from .record_cmd import _refresh_arrear_status, _sync_batch_after_change
 
     pay_date = pp["trans_date"] or parse_date(pp["created_at"]).strftime("%Y-%m-%d") if pp["created_at"] else None
     try:
@@ -360,40 +343,120 @@ def _apply_payment(conn, pending_id: int, operator: str = "银行流水导入") 
     except Exception:
         pay_date = None
 
-    conn.execute("""
-        INSERT INTO payment_records
-        (arrear_id, household_id, amount, pay_method, pay_date, operator, remark)
-        VALUES (?,?,?,?,?,?,?)
-    """, (
-        arrear["id"], arrear["household_id"], amount,
-        "银行转账", pay_date, operator,
-        f"银行流水#{pending_id} {pp['payer_name'] or ''} 原备注:{pp['remark'] or ''}"[:200],
-    ))
+    split_data = None
+    if pp["split_to_ids"]:
+        try:
+            split_data = json.loads(pp["split_to_ids"])
+        except Exception:
+            split_data = None
 
-    new_paid = (arrear["paid_amount"] or 0) + amount
-    conn.execute("UPDATE arrears SET paid_amount = ?, updated_at = datetime('now','localtime') WHERE id = ?",
-                 (new_paid, arrear["id"]))
-    _refresh_arrear_status(conn, arrear["id"])
+    if split_data:
+        total_alloc = 0.0
+        for alloc in split_data:
+            total_alloc += float(alloc.get("amount", 0))
+        if total_alloc > (pp["amount"] or 0) + 0.01:
+            console.print(f"[red]分配金额合计 {total_alloc:,.2f} 超过流水金额 {pp['amount'] or 0:,.2f}，中止确认[/red]")
+            return False
 
-    conn.execute("""
-        UPDATE pending_payments
-        SET match_status = '已确认', operator = ?, updated_at = datetime('now','localtime')
-        WHERE id = ?
-    """, (operator, pending_id))
+        processed = []
+        for alloc in split_data:
+            arrear_id = int(alloc["arrear_id"])
+            alloc_amount = float(alloc.get("amount", 0))
+            if alloc_amount <= 0:
+                continue
 
-    for bm in conn.execute("SELECT * FROM batch_members WHERE arrear_id = ?", (arrear["id"],)).fetchall():
+            arrear = conn.execute(f"""
+                SELECT a.*, h.room_no, {UNPAID_SQL_EXPR} as unpaid_calc
+                FROM arrears a JOIN households h ON a.household_id = h.id
+                WHERE a.id = ?
+            """, (arrear_id,)).fetchone()
+            if not arrear:
+                console.print(f"[yellow]⚠ 欠费ID {arrear_id} 不存在，跳过该分配[/yellow]")
+                continue
+
+            actual_amount = alloc_amount
+            if actual_amount > arrear["unpaid_calc"] + 0.01:
+                console.print(f"[yellow]⚠ 分配金额 {actual_amount:,.2f} 大于欠费 {arrear['room_no']} {arrear['fee_period']} 尚欠 {arrear['unpaid_calc']:,.2f}，按尚欠 {arrear['unpaid_calc']:,.2f} 截断，差额 {actual_amount-arrear['unpaid_calc']:,.2f} 需财务单独处理[/yellow]")
+                actual_amount = arrear["unpaid_calc"]
+
+            conn.execute("""
+                INSERT INTO payment_records
+                (arrear_id, household_id, amount, pay_method, pay_date, operator, remark, pending_id)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (
+                arrear["id"], arrear["household_id"], actual_amount,
+                "银行转账", pay_date, operator,
+                f"银行流水#{pending_id}拆分 {pp['payer_name'] or ''} 原备注:{pp['remark'] or ''}"[:200],
+                pending_id,
+            ))
+
+            new_paid = (arrear["paid_amount"] or 0) + actual_amount
+            conn.execute("UPDATE arrears SET paid_amount = ?, updated_at = datetime('now','localtime') WHERE id = ?",
+                         (new_paid, arrear["id"]))
+            _refresh_arrear_status(conn, arrear["id"])
+            _sync_batch_after_change(conn, arrear["id"], "payment")
+
+            remaining = calc_unpaid(arrear["base_amount"], arrear["late_fee"], new_paid, arrear["discount_amount"])
+            processed.append(f"{arrear['room_no']} {arrear['fee_period']} 缴费{actual_amount:,.2f}元 尚余{remaining:,.2f}元")
+
+        if not processed:
+            console.print(f"[red]没有有效分配项，中止确认[/red]")
+            return False
+
         conn.execute("""
-            UPDATE batch_members SET
-                repayment_status = CASE WHEN repayment_status = '未回款' THEN '部分回款' ELSE repayment_status END,
-                repayment_amount = COALESCE(repayment_amount,0) + ?
+            UPDATE pending_payments
+            SET match_status = '已确认', operator = ?, updated_at = datetime('now','localtime')
             WHERE id = ?
-        """, (amount, bm["id"]))
-        unpaid_check = conn.execute(f"SELECT {UNPAID_SQL_EXPR} as u FROM arrears WHERE id = ?", (arrear["id"],)).fetchone()
-        if unpaid_check and unpaid_check["u"] < 0.01:
-            conn.execute("UPDATE batch_members SET repayment_status = '全部回款' WHERE id = ?", (bm["id"],))
+        """, (operator, pending_id))
 
-    console.print(f"[green]✓ 已确认: {arrear['room_no']} {arrear['fee_period']} 缴费 {amount:,.2f} 元，尚余 {calc_unpaid(arrear['base_amount'], arrear['late_fee'], new_paid, arrear['discount_amount']):,.2f} 元[/green]")
-    return True
+        console.print(f"[green]✓ 已确认拆分缴费（流水#{pending_id}）:[/green]")
+        for p in processed:
+            console.print(f"  [green]- {p}[/green]")
+        return True
+    else:
+        if not pp["matched_arrear_id"]:
+            console.print(f"[red]记录 {pending_id} 没有匹配到欠费，请先使用 bank match 重新匹配[/red]")
+            return False
+
+        arrear = conn.execute(f"""
+            SELECT a.*, h.room_no, {UNPAID_SQL_EXPR} as unpaid_calc
+            FROM arrears a JOIN households h ON a.household_id = h.id
+            WHERE a.id = ?
+        """, (pp["matched_arrear_id"],)).fetchone()
+        if not arrear:
+            console.print(f"[red]欠费ID {pp['matched_arrear_id']} 不存在[/red]")
+            return False
+
+        amount = pp["amount"] or 0
+        if amount > arrear["unpaid_calc"] + 0.01:
+            console.print(f"[yellow]⚠ 流水金额 {amount:,.2f} 大于尚欠 {arrear['unpaid_calc']:,.2f}，按实缴 {arrear['unpaid_calc']:,.2f} 写入，剩余 {amount-arrear['unpaid_calc']:,.2f} 需财务单独处理[/yellow]")
+            amount = arrear["unpaid_calc"]
+
+        conn.execute("""
+            INSERT INTO payment_records
+            (arrear_id, household_id, amount, pay_method, pay_date, operator, remark, pending_id)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (
+            arrear["id"], arrear["household_id"], amount,
+            "银行转账", pay_date, operator,
+            f"银行流水#{pending_id} {pp['payer_name'] or ''} 原备注:{pp['remark'] or ''}"[:200],
+            pending_id,
+        ))
+
+        new_paid = (arrear["paid_amount"] or 0) + amount
+        conn.execute("UPDATE arrears SET paid_amount = ?, updated_at = datetime('now','localtime') WHERE id = ?",
+                     (new_paid, arrear["id"]))
+        _refresh_arrear_status(conn, arrear["id"])
+        _sync_batch_after_change(conn, arrear["id"], "payment")
+
+        conn.execute("""
+            UPDATE pending_payments
+            SET match_status = '已确认', operator = ?, updated_at = datetime('now','localtime')
+            WHERE id = ?
+        """, (operator, pending_id))
+
+        console.print(f"[green]✓ 已确认: {arrear['room_no']} {arrear['fee_period']} 缴费 {amount:,.2f} 元，尚余 {calc_unpaid(arrear['base_amount'], arrear['late_fee'], new_paid, arrear['discount_amount']):,.2f} 元[/green]")
+        return True
 
 
 @bank_cmd.command("confirm", help="确认单条待确认缴费，写入缴费明细")
@@ -488,6 +551,249 @@ def bank_reject(pending_id: int, reason: Optional[str], operator: str):
         """, (remark, operator, pending_id))
         conn.commit()
         console.print(f"[green]✓ 已标记流水 {pending_id} 为已拒绝[/green]")
+    finally:
+        conn.close()
+
+
+@bank_cmd.command("split", help="将一笔流水拆到同一户多个欠费账期")
+@click.argument("pending_id", type=int)
+@click.option("--allocations", default=None, help='分配方案，格式: "arrear_id1:amount1,arrear_id2:amount2"')
+@click.option("--operator", default="财务拆分", help="经办人")
+def bank_split(pending_id: int, allocations: Optional[str], operator: str):
+    conn = get_connection()
+    try:
+        pp = conn.execute("SELECT * FROM pending_payments WHERE id = ?", (pending_id,)).fetchone()
+        if not pp:
+            console.print(f"[red]流水ID {pending_id} 不存在[/red]")
+            return
+        if pp["match_status"] == "已确认":
+            console.print(f"[yellow]流水 {pending_id} 已确认过，无法拆分[/yellow]")
+            return
+
+        household_id = pp["matched_household_id"]
+        if not household_id:
+            console.print(f"[red]流水 {pending_id} 未匹配到住户，请先使用 bank match 指定匹配[/red]")
+            return
+
+        hh = conn.execute("SELECT * FROM households WHERE id = ?", (household_id,)).fetchone()
+        if not hh:
+            console.print(f"[red]住户ID {household_id} 不存在[/red]")
+            return
+
+        arrears_list = conn.execute(f"""
+            SELECT a.id, a.fee_period, a.base_amount, a.late_fee, a.paid_amount, a.discount_amount,
+                   {UNPAID_SQL_EXPR} as unpaid_calc
+            FROM arrears a
+            WHERE a.household_id = ? AND {UNPAID_SQL_EXPR} > 0
+            ORDER BY a.due_date ASC
+        """, (household_id,)).fetchall()
+
+        if not arrears_list:
+            console.print(f"[yellow]{hh['room_no']} 没有未结清的欠费记录[/yellow]")
+            return
+
+        pp_amount = float(pp["amount"] or 0)
+        console.print(f"[cyan]流水信息:[/cyan] #{pending_id} {pp['payer_name'] or '-'} 金额 {pp_amount:,.2f} 元")
+        console.print(f"[cyan]房号:[/cyan] {hh['room_no']}   [cyan]业主:[/cyan] {hh['owner_name'] or '-'}")
+        console.print("")
+
+        table = Table(title=f"{hh['room_no']} 可拆分欠费列表")
+        table.add_column("欠费ID", style="cyan")
+        table.add_column("账期", style="white")
+        table.add_column("尚欠(元)", justify="right", style="green")
+        for ar in arrears_list:
+            table.add_row(str(ar["id"]), ar["fee_period"], f"{ar['unpaid_calc']:,.2f}")
+        console.print(table)
+
+        parsed: List[Dict[str, Any]] = []
+        if allocations:
+            try:
+                for pair in allocations.split(","):
+                    pair = pair.strip()
+                    if not pair:
+                        continue
+                    aid_str, amt_str = pair.split(":")
+                    aid = int(aid_str.strip())
+                    amt = float(amt_str.strip())
+                    parsed.append({"arrear_id": aid, "amount": amt})
+            except Exception as e:
+                console.print(f"[red]分配参数格式错误: {e}，请使用格式 'arrear_id1:amount1,arrear_id2:amount2'[/red]")
+                return
+        else:
+            console.print("[yellow]请按提示输入分配方案（输入 0 作为欠费ID结束）[/yellow]")
+            total_entered = 0.0
+            while True:
+                remaining = pp_amount - total_entered
+                if remaining <= 0.01:
+                    console.print(f"[green]已分配完流水金额[/green]")
+                    break
+                try:
+                    aid_input = click.prompt(f"  欠费ID (剩余可分配 {remaining:,.2f} 元，输入0结束)", type=int)
+                except Exception:
+                    continue
+                if aid_input == 0:
+                    break
+                ar_match = next((a for a in arrears_list if a["id"] == aid_input), None)
+                if not ar_match:
+                    console.print(f"  [red]欠费ID {aid_input} 不在列表中[/red]")
+                    continue
+                try:
+                    amt_input = click.prompt(f"  分配金额（{ar_match['fee_period']} 尚欠 {ar_match['unpaid_calc']:,.2f} 元）", type=float)
+                except Exception:
+                    continue
+                if amt_input <= 0:
+                    console.print("  [yellow]金额需大于0，跳过[/yellow]")
+                    continue
+                if amt_input > remaining + 0.01:
+                    console.print(f"  [yellow]金额超过剩余可分配 {remaining:,.2f}，按剩余分配[/yellow]")
+                    amt_input = remaining
+                parsed.append({"arrear_id": aid_input, "amount": amt_input})
+                total_entered += amt_input
+
+        if not parsed:
+            console.print("[red]没有分配项，取消拆分[/red]")
+            return
+
+        valid_ar_ids = {a["id"] for a in arrears_list}
+        total_alloc = 0.0
+        filtered: List[Dict[str, Any]] = []
+        for p in parsed:
+            if p["arrear_id"] not in valid_ar_ids:
+                console.print(f"[yellow]⚠ 欠费ID {p['arrear_id']} 不属于该住户或已结清，跳过[/yellow]")
+                continue
+            if p["amount"] <= 0:
+                continue
+            filtered.append(p)
+            total_alloc += p["amount"]
+
+        if not filtered:
+            console.print("[red]没有有效分配项，取消拆分[/red]")
+            return
+
+        if total_alloc > pp_amount + 0.01:
+            console.print(f"[red]分配金额合计 {total_alloc:,.2f} 超过流水金额 {pp_amount:,.2f}，取消拆分[/red]")
+            return
+
+        split_json = json.dumps(filtered, ensure_ascii=False)
+        matched_arrear_id = filtered[0]["arrear_id"]
+        ar0 = next((a for a in arrears_list if a["id"] == matched_arrear_id), None)
+        matched_room = hh["room_no"]
+
+        conn.execute("""
+            UPDATE pending_payments SET
+                match_status = '已匹配(待确认)', match_score = 99,
+                matched_household_id = ?, matched_arrear_id = ?, matched_room = ?,
+                split_to_ids = ?, operator = ?, updated_at = datetime('now','localtime')
+            WHERE id = ?
+        """, (household_id, matched_arrear_id, matched_room, split_json, operator, pending_id))
+        conn.commit()
+
+        console.print("")
+        console.print(f"[green]✓ 拆分成功！流水#{pending_id} 分配方案：[/green]")
+        table2 = Table(title="分配明细")
+        table2.add_column("欠费ID", style="cyan")
+        table2.add_column("账期", style="white")
+        table2.add_column("分配金额(元)", justify="right", style="green")
+        table2.add_column("尚欠(元)", justify="right", style="yellow")
+        for p in filtered:
+            ar = next((a for a in arrears_list if a["id"] == p["arrear_id"]), None)
+            table2.add_row(str(p["arrear_id"]), ar["fee_period"] if ar else "-", f"{p['amount']:,.2f}",
+                           f"{ar['unpaid_calc']:,.2f}" if ar else "-")
+        console.print(table2)
+        console.print(f"分配合计: {total_alloc:,.2f} 元 / 流水金额: {pp_amount:,.2f} 元")
+        if pp_amount - total_alloc > 0.01:
+            console.print(f"[yellow]⚠ 剩余未分配: {pp_amount - total_alloc:,.2f} 元，确认缴费时不会写入[/yellow]")
+        console.print(f"使用 [cyan]pfee bank confirm {pending_id}[/cyan] 确认拆分后的缴费")
+    finally:
+        conn.close()
+
+
+@bank_cmd.command("merge", help="将多笔流水合并支付同一欠费")
+@click.argument("pending_ids_comma", type=str)
+@click.option("--arrear-id", "arrear_id", required=True, type=int, help="目标欠费ID")
+@click.option("--operator", default="财务合并", help="经办人")
+def bank_merge(pending_ids_comma: str, arrear_id: int, operator: str):
+    conn = get_connection()
+    try:
+        pending_ids: List[int] = []
+        try:
+            for s in pending_ids_comma.split(","):
+                s = s.strip()
+                if s:
+                    pending_ids.append(int(s))
+        except Exception as e:
+            console.print(f"[red]流水ID格式错误: {e}，请使用逗号分隔的数字，如 101,102,103[/red]")
+            return
+
+        if len(pending_ids) < 2:
+            console.print(f"[red]至少需要指定2笔流水才能合并[/red]")
+            return
+
+        pending_rows = []
+        total_amount = 0.0
+        for pid in pending_ids:
+            pp = conn.execute("SELECT * FROM pending_payments WHERE id = ?", (pid,)).fetchone()
+            if not pp:
+                console.print(f"[red]流水ID {pid} 不存在，中止[/red]")
+                return
+            if pp["match_status"] == "已确认":
+                console.print(f"[red]流水 {pid} 已确认过，无法合并，中止[/red]")
+                return
+            pending_rows.append(pp)
+            total_amount += float(pp["amount"] or 0)
+
+        ar = conn.execute(f"""
+            SELECT a.*, h.room_no, h.owner_name, {UNPAID_SQL_EXPR} as unpaid_calc
+            FROM arrears a JOIN households h ON a.household_id = h.id
+            WHERE a.id = ?
+        """, (arrear_id,)).fetchone()
+        if not ar:
+            console.print(f"[red]欠费ID {arrear_id} 不存在[/red]")
+            return
+
+        console.print(f"[cyan]目标欠费:[/cyan] {ar['room_no']} {ar['fee_period']} 尚欠 {ar['unpaid_calc']:,.2f} 元")
+        console.print(f"[cyan]业主:[/cyan] {ar['owner_name'] or '-'}")
+        console.print("")
+
+        table = Table(title=f"待合并流水（共{len(pending_rows)}笔，合计 {total_amount:,.2f} 元）")
+        table.add_column("流水ID", style="cyan")
+        table.add_column("日期", style="white")
+        table.add_column("付款人", style="magenta")
+        table.add_column("金额(元)", justify="right", style="green")
+        table.add_column("原状态", style="yellow")
+        for pp in pending_rows:
+            table.add_row(str(pp["id"]), pp["trans_date"] or "-", pp["payer_name"] or "-",
+                          f"{float(pp['amount'] or 0):,.2f}", pp["match_status"] or "-")
+        console.print(table)
+
+        if total_amount > ar["unpaid_calc"] + 0.01:
+            console.print(f"[yellow]⚠ 合并金额 {total_amount:,.2f} 大于尚欠 {ar['unpaid_calc']:,.2f}，逐笔确认时会按尚欠截断[/yellow]")
+        console.print("")
+
+        if not click.confirm(f"确认将以上 {len(pending_rows)} 笔流水合并到欠费 {ar['room_no']} {ar['fee_period']}？"):
+            console.print("[yellow]已取消[/yellow]")
+            return
+
+        for pp in pending_rows:
+            conn.execute("""
+                UPDATE pending_payments SET
+                    match_status = '已匹配(待确认)', match_score = 99,
+                    matched_household_id = ?, matched_arrear_id = ?, matched_room = ?,
+                    split_to_ids = NULL, operator = ?, updated_at = datetime('now','localtime')
+                WHERE id = ?
+            """, (ar["household_id"], arrear_id, ar["room_no"], operator, pp["id"]))
+
+        conn.commit()
+        console.print("")
+        console.print(f"[green]✓ 合并成功！[/green]")
+        console.print(f"  目标欠费: {ar['room_no']} {ar['fee_period']} (ID={arrear_id})")
+        console.print(f"  合并流水数: {len(pending_rows)} 笔，合计金额: {total_amount:,.2f} 元")
+        console.print(f"  流水ID: {', '.join(str(pid) for pid in pending_ids)}")
+        console.print("")
+        console.print(f"说明: 每笔流水将独立确认缴费，金额分别处理。可使用:")
+        for pid in pending_ids:
+            console.print(f"  [cyan]pfee bank confirm {pid}[/cyan]")
+        console.print(f"或批量确认: [cyan]pfee bank confirm-all[/cyan]")
     finally:
         conn.close()
 

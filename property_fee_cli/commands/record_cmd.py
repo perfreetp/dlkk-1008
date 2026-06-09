@@ -371,6 +371,15 @@ def record_discount(arrear_id, amount, reason, approved_by, remark):
         """, (amount, arrear_id))
         _refresh_arrear_status(conn, arrear_id)
         _sync_batch_after_change(conn, arrear_id, "discount", f"减免{amount}")
+        try:
+            from .archive_cmd import _write_adjustment_if_archived
+            _write_adjustment_if_archived(
+                conn, arrear_id, "费用减免", -amount,
+                f"{reason} {approved_by or ''} {remark or ''}".strip(),
+                approved_by or "财务减免"
+            )
+        except Exception:
+            pass
         conn.commit()
         console.print(f"[green]已登记减免 {format_money(amount)} 元，尚余 {format_money(new_unpaid)} 元[/green]")
     except Exception as e:
@@ -494,6 +503,15 @@ def record_payment(arrear_id, amount, pay_date, method, operator, remark):
         """, (amount, remark or None, arrear_id))
         _, _, new_st = _refresh_arrear_status(conn, arrear_id)
         _sync_batch_after_change(conn, arrear_id, "payment", f"缴费{amount}")
+        try:
+            from .archive_cmd import _write_adjustment_if_archived
+            _write_adjustment_if_archived(
+                conn, arrear_id, "实际缴费", -amount,
+                f"{method} 日期:{actual_pay_date} {remark or ''}".strip(),
+                operator or "手工登记缴费"
+            )
+        except Exception:
+            pass
         conn.commit()
         console.print(f"[green]已登记缴费 {format_money(amount)} 元，余额 {format_money(new_unpaid)} 元，状态 {new_st}[/green]")
     except Exception as e:

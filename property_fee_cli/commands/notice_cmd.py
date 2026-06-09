@@ -106,6 +106,7 @@ def _build_template_vars(arrear_row, hide_sensitive: bool) -> Dict[str, Any]:
         name = mask_name(name)
         phone = mask_phone(phone)
     unpaid = calc_unpaid(arrear_row["base_amount"], arrear_row["late_fee"], arrear_row["paid_amount"], arrear_row["discount_amount"])
+    total_owed = round(float(arrear_row["base_amount"] or 0) + float(arrear_row["late_fee"] or 0) - float(arrear_row["discount_amount"] or 0), 2)
     return {
         "owner_name": name,
         "room_no": arrear_row["room_no"],
@@ -115,7 +116,7 @@ def _build_template_vars(arrear_row, hide_sensitive: bool) -> Dict[str, Any]:
         "fee_type": arrear_row["fee_type"],
         "base_amount": format_money(arrear_row["base_amount"]),
         "late_fee": format_money(arrear_row["late_fee"]),
-        "total_amount": format_money(arrear_row["total_amount"]),
+        "total_amount": format_money(total_owed),
         "unpaid_amount": format_money(unpaid),
         "due_date": arrear_row["due_date"],
         "company_name": get_config("company_name", "XX物业服务有限公司"),

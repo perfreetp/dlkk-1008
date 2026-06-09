@@ -164,7 +164,17 @@ def calc_late_fee(building, room, period, rate, grace_days, skip_holidays, to_da
                 WHERE id = ?
             """, (r["new_late"], r["id"]))
             _refresh_arrear_status(conn, r["id"])
-            _sync_batch_after_change(conn, r["id"], "discount" if False else "", "滞纳金更新")
+            _sync_batch_after_change(conn, r["id"], "", f"滞纳金更新{round(r['diff'],2)}")
+            if abs(r["diff"]) > 0.005:
+                try:
+                    from .archive_cmd import _write_adjustment_if_archived
+                    _write_adjustment_if_archived(
+                        conn, r["id"], "滞纳金调整", r["diff"],
+                        f"逾期{r['overdue_days']}天,费率{effective_rate*100:.4f}%/日,原{format_money(r['old_late'])}→新{format_money(r['new_late'])}",
+                        "系统计算"
+                    )
+                except Exception:
+                    pass
         conn.commit()
         console.print("[green]滞纳金已更新[/green]")
     except Exception as e:
