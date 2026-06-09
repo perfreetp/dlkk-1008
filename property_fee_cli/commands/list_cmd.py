@@ -5,7 +5,7 @@ from rich.panel import Panel
 from typing import Optional
 
 from ..database import get_connection
-from ..utils import mask_phone, mask_name, should_hide_sensitive, format_money
+from ..utils import mask_phone, mask_name, should_hide_sensitive, format_money, calc_unpaid, UNPAID_SQL_EXPR
 
 console = Console()
 
@@ -65,16 +65,16 @@ def list_arrears(building, unit, floor, room, owner, status, period, min_amount,
         sql_parts.append("AND a.fee_period LIKE ?")
         params.append(f"%{period}%")
     if min_amount:
-        sql_parts.append("AND (a.total_amount - a.paid_amount - a.discount_amount) >= ?")
+        sql_parts.append(f"AND {UNPAID_SQL_EXPR} >= ?")
         params.append(min_amount)
     if max_amount:
-        sql_parts.append("AND (a.total_amount - a.paid_amount - a.discount_amount) <= ?")
+        sql_parts.append(f"AND {UNPAID_SQL_EXPR} <= ?")
         params.append(max_amount)
     if unpaid_only:
-        sql_parts.append("AND (a.total_amount - a.paid_amount - a.discount_amount) > 0")
+        sql_parts.append(f"AND {UNPAID_SQL_EXPR} > 0")
 
     order_map = {
-        "amount": "(a.total_amount - a.paid_amount - a.discount_amount) DESC",
+        "amount": f"{UNPAID_SQL_EXPR} DESC",
         "due_date": "a.due_date ASC",
         "building": "h.building ASC, h.unit ASC, h.floor ASC, h.room_no ASC",
         "room": "h.room_no ASC",
@@ -92,7 +92,7 @@ def list_arrears(building, unit, floor, room, owner, status, period, min_amount,
         console.print("[yellow]未找到匹配的欠费记录[/yellow]")
         return
 
-    total_unpaid = sum((r["total_amount"] - r["paid_amount"] - r["discount_amount"]) for r in rows)
+    total_unpaid = sum(calc_unpaid(r["base_amount"], r["late_fee"], r["paid_amount"], r["discount_amount"]) for r in rows)
     total_base = sum(r["base_amount"] for r in rows)
     total_late = sum(r["late_fee"] for r in rows)
 
@@ -100,7 +100,7 @@ def list_arrears(building, unit, floor, room, owner, status, period, min_amount,
         for r in rows:
             display_name = mask_name(r["owner_name"]) if hide else r["owner_name"]
             display_phone = mask_phone(r["phone"]) if hide else (r["phone"] or "-")
-            unpaid = r["total_amount"] - r["paid_amount"] - r["discount_amount"]
+            unpaid = calc_unpaid(r["base_amount"], r["late_fee"], r["paid_amount"], r["discount_amount"])
 
             content = f"""
 [bold cyan]房号:[/bold cyan] {r['room_no']}  ({r['building']} {r['unit'] or ''} {str(r['floor']) + '层' if r['floor'] else ''})
@@ -128,7 +128,7 @@ def list_arrears(building, unit, floor, room, owner, status, period, min_amount,
         table.add_column("状态", style="white")
 
         for r in rows:
-            unpaid = r["total_amount"] - r["paid_amount"] - r["discount_amount"]
+            unpaid = calc_unpaid(r["base_amount"], r["late_fee"], r["paid_amount"], r["discount_amount"])
             display_name = mask_name(r["owner_name"]) if hide else r["owner_name"]
             display_phone = mask_phone(r["phone"]) if hide else (r["phone"] or "-")
             status_style = {
@@ -159,12 +159,12 @@ def list_arrears(building, unit, floor, room, owner, status, period, min_amount,
 def list_households(building, has_arrears, hide_sensitive):
     hide = hide_sensitive if hide_sensitive is not None else should_hide_sensitive()
     conn = get_connection()
-    sql = """
+    sql = f"""
         SELECT h.*,
-               COALESCE(SUM(a.total_amount - a.paid_amount - a.discount_amount), 0) as total_unpaid,
+               COALESCE(SUM({UNPAID_SQL_EXPR}), 0) as total_unpaid,
                COUNT(a.id) as arrear_count
         FROM households h
-        LEFT JOIN arrears a ON h.id = a.household_id AND (a.total_amount - a.paid_amount - a.discount_amount) > 0
+        LEFT JOIN arrears a ON h.id = a.household_id AND {UNPAID_SQL_EXPR} > 0
         WHERE 1=1
     """
     params = []
@@ -237,16 +237,16 @@ def edit_phone(room_no: str, phone: str, name: Optional[str]):
 @list_cmd.command("buildings", help="查看楼栋汇总")
 def list_buildings():
     conn = get_connection()
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT h.building,
                COUNT(DISTINCT h.id) as household_count,
-               COUNT(DISTINCT CASE WHEN (a.total_amount - a.paid_amount - a.discount_amount) > 0 THEN h.id END) as arrear_hh_count,
+               COUNT(DISTINCT CASE WHEN {UNPAID_SQL_EXPR} > 0 THEN h.id END) as arrear_hh_count,
                COUNT(a.id) as arrear_count,
                COALESCE(SUM(a.base_amount), 0) as total_base,
                COALESCE(SUM(a.late_fee), 0) as total_late,
-               COALESCE(SUM(a.total_amount - a.paid_amount - a.discount_amount), 0) as total_unpaid
+               COALESCE(SUM({UNPAID_SQL_EXPR}), 0) as total_unpaid
         FROM households h
-        LEFT JOIN arrears a ON h.id = a.household_id AND (a.total_amount - a.paid_amount - a.discount_amount) > 0
+        LEFT JOIN arrears a ON h.id = a.household_id AND {UNPAID_SQL_EXPR} > 0
         GROUP BY h.building
         ORDER BY h.building
     """).fetchall()

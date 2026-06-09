@@ -4,7 +4,7 @@ from rich.console import Console
 console = Console()
 
 from .database import init_db
-from .commands import import_cmd, list_cmd, calc_cmd, notice_cmd, send_cmd, record_cmd, report_cmd
+from .commands import import_cmd, list_cmd, calc_cmd, notice_cmd, send_cmd, record_cmd, report_cmd, check_cmd
 
 
 @click.group(help="物业费催缴命令行工具 - 批量处理欠费提醒")
@@ -21,6 +21,7 @@ cli.add_command(notice_cmd.notice_cmd)
 cli.add_command(send_cmd.send_cmd)
 cli.add_command(record_cmd.record_cmd)
 cli.add_command(report_cmd.report_cmd)
+cli.add_command(check_cmd.check_cmd)
 
 
 if __name__ == "__main__":

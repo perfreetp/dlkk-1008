@@ -17,6 +17,66 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """执行数据库迁移，确保现有数据库也有新字段"""
+    cursor = conn.cursor()
+
+    def col_exists(table: str, col: str) -> bool:
+        cursor.execute(f"PRAGMA table_info({table})")
+        return any(r["name"] == col for r in cursor.fetchall())
+
+    def table_exists(table: str) -> bool:
+        cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
+        return cursor.fetchone() is not None
+
+    if not col_exists("notice_records", "is_mock"):
+        cursor.execute("ALTER TABLE notice_records ADD COLUMN is_mock INTEGER DEFAULT 1")
+
+    if not col_exists("notice_records", "provider"):
+        cursor.execute("ALTER TABLE notice_records ADD COLUMN provider TEXT DEFAULT 'mock'")
+
+    if not col_exists("notice_records", "message_id"):
+        cursor.execute("ALTER TABLE notice_records ADD COLUMN message_id TEXT")
+
+    if not col_exists("arrears", "original_total"):
+        cursor.execute("ALTER TABLE arrears ADD COLUMN original_total REAL DEFAULT 0")
+
+    if not table_exists("payment_records"):
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS payment_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                arrear_id INTEGER NOT NULL,
+                household_id INTEGER NOT NULL,
+                amount REAL NOT NULL DEFAULT 0,
+                pay_method TEXT,
+                pay_date TEXT,
+                operator TEXT,
+                remark TEXT,
+                created_at TEXT DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (arrear_id) REFERENCES arrears(id) ON DELETE CASCADE,
+                FOREIGN KEY (household_id) REFERENCES households(id) ON DELETE CASCADE
+            )
+        """)
+
+    if not col_exists("discount_records", "remark"):
+        cursor.execute("ALTER TABLE discount_records ADD COLUMN remark TEXT")
+
+    sms_configs = [
+        ("sms_provider", ""),
+        ("sms_signature", ""),
+        ("sms_api_url", ""),
+        ("sms_app_key", ""),
+        ("sms_app_secret", ""),
+        ("sms_template_code", ""),
+    ]
+    for k, v in sms_configs:
+        cursor.execute("SELECT value FROM config WHERE key = ?", (k,))
+        if not cursor.fetchone():
+            cursor.execute("INSERT INTO config (key, value) VALUES (?, ?)", (k, v))
+
+    conn.commit()
+
+
 def init_db() -> None:
     conn = get_connection()
     cursor = conn.cursor()
@@ -44,6 +104,7 @@ def init_db() -> None:
         base_amount REAL NOT NULL DEFAULT 0,
         late_fee REAL NOT NULL DEFAULT 0,
         total_amount REAL NOT NULL DEFAULT 0,
+        original_total REAL DEFAULT 0,
         due_date TEXT NOT NULL,
         paid_amount REAL NOT NULL DEFAULT 0,
         discount_amount REAL NOT NULL DEFAULT 0,
@@ -72,6 +133,9 @@ def init_db() -> None:
         content TEXT NOT NULL,
         phone TEXT,
         status TEXT DEFAULT '待发送',
+        is_mock INTEGER DEFAULT 1,
+        provider TEXT DEFAULT 'mock',
+        message_id TEXT,
         retry_count INTEGER DEFAULT 0,
         max_retry INTEGER DEFAULT 3,
         sent_at TEXT,
@@ -104,6 +168,21 @@ def init_db() -> None:
         discount_reason TEXT,
         approved_by TEXT,
         approved_at TEXT,
+        remark TEXT,
+        created_at TEXT DEFAULT (datetime('now','localtime')),
+        FOREIGN KEY (arrear_id) REFERENCES arrears(id) ON DELETE CASCADE,
+        FOREIGN KEY (household_id) REFERENCES households(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        arrear_id INTEGER NOT NULL,
+        household_id INTEGER NOT NULL,
+        amount REAL NOT NULL DEFAULT 0,
+        pay_method TEXT,
+        pay_date TEXT,
+        operator TEXT,
+        remark TEXT,
         created_at TEXT DEFAULT (datetime('now','localtime')),
         FOREIGN KEY (arrear_id) REFERENCES arrears(id) ON DELETE CASCADE,
         FOREIGN KEY (household_id) REFERENCES households(id) ON DELETE CASCADE
@@ -128,9 +207,9 @@ def init_db() -> None:
         cursor.executemany("""
         INSERT INTO notice_templates (name, content, is_default) VALUES (?, ?, ?)
         """, [
-            ("通用催缴短信", "【XX物业】尊敬的{owner_name}业主，您{room_no}室的{fee_period}{fee_type}共计{total_amount}元已于{due_date}到期，请您尽快缴纳。如有疑问请致电客服热线。退订回T", 1),
-            ("温馨提醒短信", "【XX物业】温馨提醒：尊敬的{owner_name}业主，您{room_no}室尚有{fee_period}的物业费用未缴，合计{total_amount}元。请您在方便时前往物业中心或线上缴纳，感谢您的配合！退订回T", 0),
-            ("滞纳金提醒", "【XX物业】尊敬的{owner_name}业主，您{room_no}室的{fee_period}{fee_type}已逾期，本金{base_amount}元，产生滞纳金{late_fee}元，合计{total_amount}元。请尽快缴纳以免产生更多滞纳金。退订回T", 0),
+            ("通用催缴短信", "【{signature}】尊敬的{owner_name}业主，您{room_no}室的{fee_period}{fee_type}共计{total_amount}元已于{due_date}到期，请您尽快缴纳。如有疑问请致电{service_phone}。退订回T", 1),
+            ("温馨提醒短信", "【{signature}】温馨提醒：尊敬的{owner_name}业主，您{room_no}室尚有{fee_period}的物业费用未缴，合计{unpaid_amount}元。请您在方便时前往物业中心或线上缴纳，感谢您的配合！退订回T", 0),
+            ("滞纳金提醒", "【{signature}】尊敬的{owner_name}业主，您{room_no}室的{fee_period}{fee_type}已逾期，本金{base_amount}元，产生滞纳金{late_fee}元，合计{unpaid_amount}元。请尽快缴纳以免产生更多滞纳金。退订回T", 0),
         ])
 
     cursor.execute("SELECT COUNT(*) FROM config")
@@ -143,6 +222,12 @@ def init_db() -> None:
             ("company_name", "XX物业服务有限公司"),
             ("service_phone", "400-123-4567"),
             ("hide_sensitive", "1"),
+            ("sms_provider", ""),
+            ("sms_signature", "XX物业"),
+            ("sms_api_url", ""),
+            ("sms_app_key", ""),
+            ("sms_app_secret", ""),
+            ("sms_template_code", ""),
         ]
         cursor.executemany("INSERT INTO config (key, value) VALUES (?, ?)", default_configs)
 
@@ -170,6 +255,7 @@ def init_db() -> None:
         cursor.executemany("INSERT INTO holidays (holiday_date, holiday_name) VALUES (?, ?)", default_holidays)
 
     conn.commit()
+    _migrate(conn)
     conn.close()
 
 

@@ -7,7 +7,7 @@ from rich.table import Table
 from typing import Optional
 
 from ..database import get_connection
-from ..utils import mask_phone, mask_name, should_hide_sensitive, format_money
+from ..utils import mask_phone, mask_name, should_hide_sensitive, format_money, calc_unpaid, UNPAID_SQL_EXPR
 
 console = Console()
 
@@ -74,7 +74,7 @@ def export_ledger(output, building, room, status, period, unpaid_only, hide_sens
         sql += " AND a.fee_period LIKE ?"
         params.append(f"%{period}%")
     if unpaid_only:
-        sql += " AND (a.total_amount - a.paid_amount - a.discount_amount) > 0"
+        sql += f" AND {UNPAID_SQL_EXPR} > 0"
     sql += " ORDER BY h.building, h.room_no, a.fee_period"
 
     rows = conn.execute(sql, params).fetchall()
@@ -97,7 +97,7 @@ def export_ledger(output, building, room, status, period, unpaid_only, hide_sens
         writer.writerow(headers)
 
         for r in rows:
-            unpaid = r["total_amount"] - r["paid_amount"] - r["discount_amount"]
+            unpaid = calc_unpaid(r["base_amount"], r["late_fee"], r["paid_amount"], r["discount_amount"])
             name = mask_name(r["owner_name"]) if hide else r["owner_name"]
             phone = mask_phone(r["phone"]) if hide else (r["phone"] or "")
             writer.writerow([
@@ -113,7 +113,7 @@ def export_ledger(output, building, room, status, period, unpaid_only, hide_sens
                 r["remark"] or "",
             ])
 
-    total_unpaid = sum(r["total_amount"] - r["paid_amount"] - r["discount_amount"] for r in rows)
+    total_unpaid = sum(calc_unpaid(r["base_amount"], r["late_fee"], r["paid_amount"], r["discount_amount"]) for r in rows)
     console.print(f"[green]已导出 {len(rows)} 条记录到 {output}[/green]")
     console.print(f"[dim]尚欠合计: {format_money(total_unpaid)} 元，敏感信息隐藏: {'是' if hide else '否'}[/dim]")
 
@@ -123,21 +123,21 @@ def export_ledger(output, building, room, status, period, unpaid_only, hide_sens
 @click.option("--encoding", default="utf-8-sig")
 def building_summary(output, encoding):
     conn = get_connection()
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT
             h.building,
             COUNT(DISTINCT h.id) as total_households,
-            COUNT(DISTINCT CASE WHEN (a.total_amount - a.paid_amount - a.discount_amount) > 0 THEN h.id END) as arrear_households,
+            COUNT(DISTINCT CASE WHEN {UNPAID_SQL_EXPR} > 0 THEN h.id END) as arrear_households,
             COUNT(DISTINCT a.id) as total_arrears,
             COUNT(DISTINCT CASE WHEN a.status = '承诺付款' THEN a.id END) as commitment_count,
             COUNT(DISTINCT CASE WHEN a.status = '减免' THEN a.id END) as discount_count,
             COALESCE(SUM(a.base_amount), 0) as total_base,
             COALESCE(SUM(a.late_fee), 0) as total_late,
-            COALESCE(SUM(CASE WHEN (a.total_amount - a.paid_amount - a.discount_amount) > 0
+            COALESCE(SUM(CASE WHEN {UNPAID_SQL_EXPR} > 0
                 THEN a.base_amount END), 0) as unpaid_base,
-            COALESCE(SUM(CASE WHEN (a.total_amount - a.paid_amount - a.discount_amount) > 0
+            COALESCE(SUM(CASE WHEN {UNPAID_SQL_EXPR} > 0
                 THEN a.late_fee END), 0) as unpaid_late,
-            COALESCE(SUM(a.total_amount - a.paid_amount - a.discount_amount), 0) as total_unpaid,
+            COALESCE(SUM({UNPAID_SQL_EXPR}), 0) as total_unpaid,
             COALESCE(SUM(a.paid_amount), 0) as total_paid,
             COALESCE(SUM(a.discount_amount), 0) as total_discount,
             COALESCE(ns.send_count, 0) as notice_sent,
@@ -257,7 +257,8 @@ def query_history(room_no, building, from_date, to_date, rtype, output, limit, h
         sql = """
             SELECT '短信' as rtype, nr.created_at as event_time, h.room_no, h.building,
                    h.owner_name, nr.phone, nr.channel, nr.status,
-                   nr.content as detail, nr.sent_at, '' as extra1, '' as extra2
+                   nr.content as detail, nr.sent_at, '' as extra1, '' as extra2,
+                   nr.is_mock as is_mock
             FROM notice_records nr JOIN households h ON nr.household_id = h.id
             WHERE 1=1
         """
@@ -284,7 +285,8 @@ def query_history(room_no, building, from_date, to_date, rtype, output, limit, h
                    h.owner_name, h.phone, '电话' as channel, cr.call_result as status,
                    cr.remark as detail, '' as sent_at,
                    COALESCE(cr.commitment_date, '') as extra1,
-                   CASE WHEN cr.commitment_amount > 0 THEN printf('%.2f', cr.commitment_amount) ELSE '' END as extra2
+                   CASE WHEN cr.commitment_amount > 0 THEN printf('%.2f', cr.commitment_amount) ELSE '' END as extra2,
+                   NULL as is_mock
             FROM call_records cr JOIN households h ON cr.household_id = h.id
             WHERE 1=1
         """
@@ -318,6 +320,7 @@ def query_history(room_no, building, from_date, to_date, rtype, output, limit, h
     table = Table(title=f"催缴历史记录（共 {len(all_rows)} 条）")
     table.add_column("时间", style="white", no_wrap=True)
     table.add_column("类型", style="cyan")
+    table.add_column("真实/模拟", style="white")
     table.add_column("房号", style="green")
     table.add_column("业主", style="magenta")
     table.add_column("联系方式", style="yellow")
@@ -334,8 +337,15 @@ def query_history(room_no, building, from_date, to_date, rtype, output, limit, h
                 detail += f" {r['extra2']}元"
         rtype_style = "cyan" if r["rtype"] == "短信" else "blue"
         status_style = {"已发送": "green", "发送失败": "red"}.get(r["status"], "white")
+        if r["is_mock"] is None:
+            mock_label = "-"
+            mock_style = "dim"
+        else:
+            mock_label = "模拟" if r["is_mock"] else "真实"
+            mock_style = "yellow" if r["is_mock"] else "green"
         table.add_row(
             r["event_time"], f"[{rtype_style}]{r['rtype']}[/{rtype_style}]",
+            f"[{mock_style}]{mock_label}[/{mock_style}]",
             r["room_no"], name, phone,
             f"[{status_style}]{r['status']}[/{status_style}]",
             detail + ("..." if len(r["detail"] or "") > 40 else ""),
@@ -345,12 +355,16 @@ def query_history(room_no, building, from_date, to_date, rtype, output, limit, h
     if output:
         with open(output, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["时间", "类型", "房号", "楼栋", "业主", "联系方式", "状态", "详情", "承诺日期", "承诺金额"])
+            writer.writerow(["时间", "类型", "真实/模拟", "房号", "楼栋", "业主", "联系方式", "状态", "详情", "承诺日期", "承诺金额"])
             for r in all_rows:
                 name = mask_name(r["owner_name"]) if hide else r["owner_name"]
                 phone = mask_phone(r["phone"]) if hide else (r["phone"] or "")
+                if r["is_mock"] is None:
+                    mock_label = "-"
+                else:
+                    mock_label = "模拟" if r["is_mock"] else "真实"
                 writer.writerow([
-                    r["event_time"], r["rtype"], r["room_no"], r["building"], name, phone,
+                    r["event_time"], r["rtype"], mock_label, r["room_no"], r["building"], name, phone,
                     r["status"], r["detail"] or "", r["extra1"] or "", r["extra2"] or "",
                 ])
         console.print(f"\n[green]历史记录已导出到 {output}[/green]")
@@ -360,10 +374,10 @@ def query_history(room_no, building, from_date, to_date, rtype, output, limit, h
 def dashboard():
     conn = get_connection()
 
-    overview = conn.execute("""
+    overview = conn.execute(f"""
         SELECT
             COUNT(DISTINCT h.id) as total_hh,
-            COUNT(DISTINCT CASE WHEN (a.total_amount - a.paid_amount - a.discount_amount) > 0 THEN h.id END) as arrear_hh,
+            COUNT(DISTINCT CASE WHEN {UNPAID_SQL_EXPR} > 0 THEN h.id END) as arrear_hh,
             COUNT(DISTINCT a.id) as total_arrears,
             COUNT(DISTINCT CASE WHEN a.status = '承诺付款' THEN a.id END) as cnt_commitment,
             COUNT(DISTINCT CASE WHEN a.status = '部分缴纳' THEN a.id END) as cnt_partial,
@@ -371,8 +385,8 @@ def dashboard():
             COUNT(DISTINCT CASE WHEN a.status = '已缴' THEN a.id END) as cnt_paid,
             COALESCE(SUM(a.base_amount), 0) as sum_base,
             COALESCE(SUM(a.late_fee), 0) as sum_late,
-            COALESCE(SUM(CASE WHEN (a.total_amount - a.paid_amount - a.discount_amount) > 0
-                THEN (a.total_amount - a.paid_amount - a.discount_amount) END), 0) as sum_unpaid,
+            COALESCE(SUM(CASE WHEN {UNPAID_SQL_EXPR} > 0
+                THEN {UNPAID_SQL_EXPR} END), 0) as sum_unpaid,
             COALESCE(SUM(a.paid_amount), 0) as sum_paid,
             COALESCE(SUM(a.discount_amount), 0) as sum_discount
         FROM households h LEFT JOIN arrears a ON h.id = a.household_id
@@ -386,12 +400,12 @@ def dashboard():
         SELECT call_result, COUNT(*) as cnt FROM call_records GROUP BY call_result
     """).fetchall()
 
-    top_arrears = conn.execute("""
+    top_arrears = conn.execute(f"""
         SELECT h.room_no, h.building, h.owner_name, h.phone,
-               SUM(a.total_amount - a.paid_amount - a.discount_amount) as total_unpaid,
+               SUM({UNPAID_SQL_EXPR}) as total_unpaid,
                COUNT(a.id) as cnt
         FROM arrears a JOIN households h ON a.household_id = h.id
-        WHERE (a.total_amount - a.paid_amount - a.discount_amount) > 0
+        WHERE {UNPAID_SQL_EXPR} > 0
         GROUP BY h.id
         ORDER BY total_unpaid DESC LIMIT 10
     """).fetchall()
@@ -464,3 +478,263 @@ def dashboard():
             table.add_row(f"#{i}", r["room_no"], r["building"], name,
                           str(r["cnt"]), format_money(r["total_unpaid"]))
         console.print(table)
+
+
+@report_cmd.command("file", help="单户催缴档案（按房号输出完整时间线）")
+@click.argument("room")
+@click.option("--output", "-o", type=click.Path(writable=True), help="导出CSV路径")
+@click.option("--hide-sensitive/--show-sensitive", default=None)
+@click.option("--encoding", default="utf-8-sig")
+def household_file(room, output, hide_sensitive, encoding):
+    hide = hide_sensitive if hide_sensitive is not None else should_hide_sensitive()
+    conn = get_connection()
+
+    hh = conn.execute("SELECT * FROM households WHERE room_no = ?", (room,)).fetchone()
+    if not hh:
+        conn.close()
+        console.print(f"[red]未找到房号 [{room}] 的业主档案[/red]")
+        return
+
+    household_id = hh["id"]
+    arrears_list = conn.execute(f"""
+        SELECT a.*, {UNPAID_SQL_EXPR} as unpaid_amount
+        FROM arrears a WHERE a.household_id = ? ORDER BY a.fee_period
+    """, (household_id,)).fetchall()
+
+    notice_list = conn.execute("""
+        SELECT nr.*, a.fee_period FROM notice_records nr
+        LEFT JOIN arrears a ON nr.arrear_id = a.id
+        WHERE nr.household_id = ? ORDER BY nr.created_at
+    """, (household_id,)).fetchall()
+
+    call_list = conn.execute("""
+        SELECT cr.*, a.fee_period FROM call_records cr
+        LEFT JOIN arrears a ON cr.arrear_id = a.id
+        WHERE cr.household_id = ? ORDER BY cr.call_time
+    """, (household_id,)).fetchall()
+
+    discount_list = conn.execute("""
+        SELECT dr.*, a.fee_period FROM discount_records dr
+        LEFT JOIN arrears a ON dr.arrear_id = a.id
+        WHERE dr.household_id = ? ORDER BY dr.created_at
+    """, (household_id,)).fetchall()
+
+    payment_list = conn.execute("""
+        SELECT pr.*, a.fee_period FROM payment_records pr
+        LEFT JOIN arrears a ON pr.arrear_id = a.id
+        WHERE pr.household_id = ? ORDER BY pr.created_at
+    """, (household_id,)).fetchall()
+
+    conn.close()
+
+    total_base = sum(r["base_amount"] for r in arrears_list)
+    total_late = sum(r["late_fee"] for r in arrears_list)
+    total_paid = sum(r["paid_amount"] for r in arrears_list)
+    total_discount = sum(r["discount_amount"] for r in arrears_list)
+    total_unpaid = sum(calc_unpaid(r["base_amount"], r["late_fee"], r["paid_amount"], r["discount_amount"]) for r in arrears_list)
+
+    owner_name = mask_name(hh["owner_name"]) if hide else hh["owner_name"]
+    phone = mask_phone(hh["phone"]) if hide else (hh["phone"] or "-")
+
+    console.print(f"[bold magenta]===== 单户催缴档案：{hh['room_no']} =====[/bold magenta]\n")
+
+    header_table = Table(show_header=False, show_lines=False, box=None, padding=(0, 3))
+    header_table.add_column(style="bold cyan")
+    header_table.add_column()
+    header_table.add_column(style="bold cyan")
+    header_table.add_column()
+    header_table.add_row("房号", f"[green]{hh['room_no']}[/green]", "楼栋", hh["building"] or "-")
+    header_table.add_row("业主", owner_name, "联系电话", phone)
+    header_table.add_row("建筑面积", f"{hh['area'] or 0:.2f} ㎡", "物业类型", hh["property_type"] or "-")
+    if hh["unit"]:
+        header_table.add_row("单元", str(hh["unit"]), "楼层", str(hh["floor"]) if hh["floor"] else "-")
+    console.print(header_table)
+
+    console.print("\n[bold]📊 欠费汇总:[/bold]")
+    sum_table = Table(show_header=False, show_lines=False, box=None, padding=(0, 3))
+    sum_table.add_column(style="bold")
+    sum_table.add_column()
+    sum_table.add_column(style="bold")
+    sum_table.add_column()
+    sum_table.add_row("总本金", f"[cyan]{format_money(total_base)} 元[/cyan]",
+                      "总滞纳金", f"[red]{format_money(total_late)} 元[/red]")
+    sum_table.add_row("总已缴", f"[green]{format_money(total_paid)} 元[/green]",
+                      "总减免", f"[magenta]{format_money(total_discount)} 元[/magenta]")
+    sum_table.add_row("[bold red]总尚欠[/bold red]",
+                      f"[bold red]{format_money(total_unpaid)} 元[/bold red]",
+                      "欠费笔数", f"{len(arrears_list)} 笔")
+    console.print(sum_table)
+
+    if arrears_list:
+        console.print("\n[bold]📋 各账期明细:[/bold]")
+        period_table = Table()
+        period_table.add_column("账期", style="cyan")
+        period_table.add_column("费用类型")
+        period_table.add_column("本金", justify="right", style="cyan")
+        period_table.add_column("滞纳金", justify="right", style="red")
+        period_table.add_column("已缴", justify="right", style="green")
+        period_table.add_column("减免", justify="right", style="magenta")
+        period_table.add_column("尚欠", justify="right", style="bold red")
+        period_table.add_column("应缴日")
+        period_table.add_column("状态", style="yellow")
+        for a in arrears_list:
+            unpaid = calc_unpaid(a["base_amount"], a["late_fee"], a["paid_amount"], a["discount_amount"])
+            period_table.add_row(
+                a["fee_period"], a["fee_type"] or "-",
+                format_money(a["base_amount"]), format_money(a["late_fee"]),
+                format_money(a["paid_amount"]), format_money(a["discount_amount"]),
+                format_money(unpaid), a["due_date"], a["status"] or "-"
+            )
+        console.print(period_table)
+
+    events = []
+    for a in arrears_list:
+        unpaid = calc_unpaid(a["base_amount"], a["late_fee"], a["paid_amount"], a["discount_amount"])
+        detail = f"账期:{a['fee_period']} 本金:{format_money(a['base_amount'])}元 应缴日:{a['due_date']}"
+        amount_change = f"+{format_money(a['base_amount'] + a['late_fee'])}"
+        events.append({
+            "time": a["created_at"],
+            "type": "欠费产生",
+            "type_style": "bold red",
+            "detail": detail,
+            "amount_change": amount_change,
+            "export_detail": detail,
+            "export_amount": a["base_amount"] + a["late_fee"],
+            "fee_period": a["fee_period"],
+        })
+
+    for n in notice_list:
+        mock_label = "模拟" if n["is_mock"] else "真实"
+        content_preview = (n["content"] or "")[:30]
+        phone_display = mask_phone(n["phone"]) if hide else (n["phone"] or "-")
+        detail = f"状态:{n['status']} [{mock_label}] 手机号:{phone_display} 内容:{content_preview}"
+        events.append({
+            "time": n["created_at"],
+            "type": "短信通知",
+            "type_style": "cyan",
+            "detail": detail,
+            "amount_change": "-",
+            "export_detail": f"状态:{n['status']} 是否模拟:{mock_label} 手机号:{n['phone'] or ''} 内容:{n['content'] or ''}",
+            "export_amount": "",
+            "fee_period": n["fee_period"] or "",
+            "mock": mock_label,
+        })
+
+    for c in call_list:
+        detail_parts = [f"结果:{c['call_result'] or '-'}"]
+        if c["commitment_date"]:
+            detail_parts.append(f"承诺日:{c['commitment_date']}")
+        if c["commitment_amount"] and c["commitment_amount"] > 0:
+            detail_parts.append(f"承诺金额:{format_money(c['commitment_amount'])}元")
+        if c["remark"]:
+            detail_parts.append(f"备注:{c['remark'][:20]}")
+        detail = " ".join(detail_parts)
+        events.append({
+            "time": c["call_time"],
+            "type": "电话沟通",
+            "type_style": "blue",
+            "detail": detail,
+            "amount_change": "-",
+            "export_detail": f"结果:{c['call_result'] or ''} 承诺日期:{c['commitment_date'] or ''} 承诺金额:{c['commitment_amount'] or 0} 备注:{c['remark'] or ''}",
+            "export_amount": "",
+            "fee_period": c["fee_period"] or "",
+            "mock": "-",
+        })
+
+    for d in discount_list:
+        detail_parts = [f"金额:{format_money(d['discount_amount'])}元"]
+        if d["discount_reason"]:
+            detail_parts.append(f"原因:{d['discount_reason']}")
+        if d["approved_by"]:
+            detail_parts.append(f"审批人:{d['approved_by']}")
+        detail = " ".join(detail_parts)
+        events.append({
+            "time": d["created_at"],
+            "type": "费用减免",
+            "type_style": "magenta",
+            "detail": detail,
+            "amount_change": f"-{format_money(d['discount_amount'])}",
+            "export_detail": f"减免金额:{d['discount_amount']} 原因:{d['discount_reason'] or ''} 审批人:{d['approved_by'] or ''} 备注:{d['remark'] or ''}",
+            "export_amount": -float(d["discount_amount"] or 0),
+            "fee_period": d["fee_period"] or "",
+            "mock": "-",
+        })
+
+    for p in payment_list:
+        detail_parts = [f"金额:{format_money(p['amount'])}元"]
+        if p["pay_method"]:
+            detail_parts.append(f"方式:{p['pay_method']}")
+        if p["pay_date"]:
+            detail_parts.append(f"日期:{p['pay_date']}")
+        if p["operator"]:
+            detail_parts.append(f"经办人:{p['operator']}")
+        detail = " ".join(detail_parts)
+        events.append({
+            "time": p["created_at"],
+            "type": "缴费记录",
+            "type_style": "green",
+            "detail": detail,
+            "amount_change": f"-{format_money(p['amount'])}",
+            "export_detail": f"缴费金额:{p['amount']} 方式:{p['pay_method'] or ''} 缴费日期:{p['pay_date'] or ''} 经办人:{p['operator'] or ''} 备注:{p['remark'] or ''}",
+            "export_amount": -float(p["amount"] or 0),
+            "fee_period": p["fee_period"] or "",
+            "mock": "-",
+        })
+
+    events.sort(key=lambda e: e["time"] or "")
+
+    console.print(f"\n[bold]⏰ 事件时间线（共 {len(events)} 条）:[/bold]")
+    timeline = Table()
+    timeline.add_column("时间", style="white", no_wrap=True)
+    timeline.add_column("类型", style="white")
+    timeline.add_column("详情", style="white")
+    timeline.add_column("金额变化", justify="right", style="white")
+    for e in events:
+        timeline.add_row(
+            e["time"],
+            f"[{e['type_style']}]{e['type']}[/{e['type_style']}]",
+            e["detail"],
+            e["amount_change"],
+        )
+    console.print(timeline)
+
+    if output:
+        with open(output, "w", encoding=encoding, newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["=== 单户催缴档案 ==="])
+            writer.writerow(["房号", "楼栋", "单元", "楼层", "业主姓名", "联系电话", "建筑面积(㎡)", "物业类型"])
+            writer.writerow([
+                hh["room_no"], hh["building"] or "", hh["unit"] or "", hh["floor"] or "",
+                owner_name, phone, hh["area"] or "", hh["property_type"] or ""
+            ])
+            writer.writerow([])
+            writer.writerow(["=== 欠费汇总 ==="])
+            writer.writerow(["总本金", "总滞纳金", "总已缴", "总减免", "总尚欠", "欠费笔数"])
+            writer.writerow([
+                f"{total_base:.2f}", f"{total_late:.2f}", f"{total_paid:.2f}",
+                f"{total_discount:.2f}", f"{total_unpaid:.2f}", len(arrears_list)
+            ])
+            writer.writerow([])
+            writer.writerow(["=== 账期明细 ==="])
+            writer.writerow([
+                "账期", "费用类型", "本金", "滞纳金", "已缴", "减免", "尚欠", "应缴日", "状态"
+            ])
+            for a in arrears_list:
+                unpaid = calc_unpaid(a["base_amount"], a["late_fee"], a["paid_amount"], a["discount_amount"])
+                writer.writerow([
+                    a["fee_period"], a["fee_type"] or "",
+                    f"{a['base_amount']:.2f}", f"{a['late_fee']:.2f}",
+                    f"{a['paid_amount']:.2f}", f"{a['discount_amount']:.2f}",
+                    f"{unpaid:.2f}", a["due_date"], a["status"] or ""
+                ])
+            writer.writerow([])
+            writer.writerow(["=== 事件时间线 ==="])
+            writer.writerow([
+                "时间", "类型", "真实/模拟", "关联账期", "详情", "金额变化"
+            ])
+            for e in events:
+                writer.writerow([
+                    e["time"], e["type"], e.get("mock", "-"),
+                    e.get("fee_period", ""), e["export_detail"], e["export_amount"]
+                ])
+        console.print(f"\n[green]单户催缴档案已导出到 {output}[/green]")

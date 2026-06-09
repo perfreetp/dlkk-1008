@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any
 from ..database import get_connection
 from ..utils import (
     mask_phone, mask_name, should_hide_sensitive, format_money,
-    is_holiday, next_workday, get_config
+    is_holiday, next_workday, get_config, get_sms_signature, calc_unpaid
 )
 
 console = Console()
@@ -104,7 +104,7 @@ def _build_template_vars(arrear_row, hide_sensitive: bool) -> Dict[str, Any]:
     if hide_sensitive:
         name = mask_name(name)
         phone = mask_phone(phone)
-    unpaid = arrear_row["total_amount"] - arrear_row["paid_amount"] - arrear_row["discount_amount"]
+    unpaid = calc_unpaid(arrear_row["base_amount"], arrear_row["late_fee"], arrear_row["paid_amount"], arrear_row["discount_amount"])
     return {
         "owner_name": name,
         "room_no": arrear_row["room_no"],
@@ -119,6 +119,7 @@ def _build_template_vars(arrear_row, hide_sensitive: bool) -> Dict[str, Any]:
         "due_date": arrear_row["due_date"],
         "company_name": get_config("company_name", "XX物业服务有限公司"),
         "service_phone": get_config("service_phone", "400-123-4567"),
+        "signature": get_sms_signature(),
     }
 
 
@@ -328,6 +329,7 @@ def notice_queue(status, limit):
     table.add_column("渠道", style="blue")
     table.add_column("模板", style="yellow")
     table.add_column("手机号", style="yellow")
+    table.add_column("类型", style="white")
     table.add_column("状态", style="white")
     table.add_column("重试", justify="right")
     table.add_column("发送时间", style="white")
@@ -337,9 +339,13 @@ def notice_queue(status, limit):
         phone = mask_phone(r["phone"]) if hide else (r["phone"] or "-")
         name = mask_name(r["owner_name"]) if hide else r["owner_name"]
         status_style = {"待发送": "cyan", "发送中": "yellow", "已发送": "green", "发送失败": "red"}.get(r["status"], "white")
+        is_mock = bool(r["is_mock"]) if r["is_mock"] is not None else True
+        type_style = "yellow" if is_mock else "green"
+        type_text = "模拟" if is_mock else "真实"
         table.add_row(
             str(r["id"]), r["room_no"], name, r["channel"], r["template_name"] or "-",
-            phone, f"[{status_style}]{r['status']}[/{status_style}]",
+            phone, f"[{type_style}]{type_text}[/{type_style}]",
+            f"[{status_style}]{r['status']}[/{status_style}]",
             f"{r['retry_count']}/{r['max_retry']}",
             r["sent_at"] or r["created_at"],
         )

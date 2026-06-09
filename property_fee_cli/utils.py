@@ -1,5 +1,5 @@
 from datetime import datetime, date, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 from .database import get_connection
 
 
@@ -39,6 +39,41 @@ def set_config(key: str, value: str) -> None:
     """, (key, value))
     conn.commit()
     conn.close()
+
+
+def calc_unpaid(base_amount: float, late_fee: float, paid_amount: float, discount_amount: float) -> float:
+    """统一口径：尚欠 = 本金 + 滞纳金 - 已缴 - 减免。浮点保留两位，负值修正为0。"""
+    raw = round(float(base_amount or 0) + float(late_fee or 0)
+                - float(paid_amount or 0) - float(discount_amount or 0), 2)
+    return raw if raw > 0 else 0.0
+
+
+def calc_total_owed(base_amount: float, late_fee: float, discount_amount: float) -> float:
+    """统一口径：应缴总额 = 本金 + 滞纳金 - 减免"""
+    return round(float(base_amount or 0) + float(late_fee or 0) - float(discount_amount or 0), 2)
+
+
+UNPAID_SQL_EXPR = "(COALESCE(a.base_amount,0) + COALESCE(a.late_fee,0) - COALESCE(a.paid_amount,0) - COALESCE(a.discount_amount,0))"
+TOTAL_OWED_SQL_EXPR = "(COALESCE(a.base_amount,0) + COALESCE(a.late_fee,0) - COALESCE(a.discount_amount,0))"
+
+
+def is_sms_real_configured() -> Tuple[bool, dict]:
+    """检查是否配置了真实短信服务。返回(已配置, 配置字典)"""
+    keys = ["sms_provider", "sms_signature", "sms_api_url", "sms_app_key", "sms_app_secret", "sms_template_code"]
+    cfg = {}
+    conn = get_connection()
+    for k in keys:
+        row = conn.execute("SELECT value FROM config WHERE key = ?", (k,)).fetchone()
+        cfg[k] = row["value"] if row else ""
+    conn.close()
+
+    required = ["sms_provider", "sms_api_url", "sms_app_key", "sms_app_secret"]
+    ok = all(cfg[k] and cfg[k].strip() for k in required)
+    return ok, cfg
+
+
+def get_sms_signature() -> str:
+    return get_config("sms_signature") or "物业提醒"
 
 
 def is_holiday(check_date: date) -> bool:
@@ -93,3 +128,12 @@ def parse_date(date_str: str) -> date:
 
 def format_money(amount: float) -> str:
     return f"{amount:,.2f}"
+
+
+def determine_status(unpaid: float, has_commitment: bool = False) -> str:
+    """根据尚欠金额统一判断状态"""
+    if unpaid <= 0.01:
+        return "已缴"
+    if has_commitment:
+        return "承诺付款"
+    return "未缴"
